@@ -1,0 +1,183 @@
+/* ── Reset ── */
+
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  color: #e8e8e8;
+  background: #0a0a0a;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  min-height: 100vh;
+  padding: 2rem;
+}
+
+img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* ── Pegboard Grid ── */
+
+.pegboard {
+  display: grid;
+  grid-template-columns: repeat(var(--pg-columns, 12), 1fr);
+  grid-auto-rows: var(--pg-row-height, 100px);
+  gap: var(--pg-gap, 16px);
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+/* Faint grid overlay — visible guide for the pegboard concept */
+.pegboard::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+/* ── Peg Elements ── */
+
+.peg-element {
+  position: relative;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #141414;
+  border: 1px solid #1e1e1e;
+  transition: border-color 0.25s ease, box-shadow 0.25s ease;
+}
+
+.peg-element:hover {
+  border-color: #2a2a2a;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+}
+
+/* ── Text Block ── */
+
+.block-text {
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  height: 100%;
+}
+
+.block-text h1 {
+  font-size: clamp(2rem, 5vw, 4rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+}
+
+.block-text h2 {
+  font-size: clamp(1.5rem, 3vw, 2.5rem);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+
+.block-text h3 {
+  font-size: clamp(1.1rem, 2vw, 1.5rem);
+  font-weight: 500;
+  line-height: 1.3;
+}
+
+.block-text p {
+  font-size: 1rem;
+  color: #999;
+  max-width: 50ch;
+}
+
+.block-text .subtext {
+  margin-top: 0.75rem;
+  font-size: 0.875rem;
+  color: #666;
+}
+
+/* ── Image Block ── */
+
+.block-image {
+  position: relative;
+  height: 100%;
+}
+
+.block-image .caption {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 0.75rem 1rem;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.7));
+  font-size: 0.8rem;
+  color: #ccc;
+}
+
+/* ── Split Block ── */
+
+.block-split {
+  display: flex;
+  height: 100%;
+  user-select: none;
+}
+
+.split-side {
+  overflow: hidden;
+}
+
+.split-left {
+  flex: var(--split-ratio, 0.5);
+  min-width: 0;
+}
+
+.split-right {
+  flex: calc(1 - var(--split-ratio, 0.5));
+  min-width: 0;
+}
+
+.split-divider {
+  width: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: col-resize;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.split-handle {
+  width: 3px;
+  height: 40px;
+  border-radius: 2px;
+  background: #333;
+  transition: background 0.2s ease, height 0.2s ease;
+}
+
+.split-divider:hover .split-handle,
+.is-resizing .split-handle {
+  background: #666;
+  height: 60px;
+}
+
+.is-resizing {
+  cursor: col-resize;
+}
+
+/* ── Placeholder SVG for images ── */
+
+.block-image img[src$=".svg"] {
+  background: #1a1a1a;
+}

@@ -1,0 +1,119 @@
+{
+  "grid": {
+    "columns": 12,
+    "rowHeight": 100,
+    "gap": 16
+  },
+  "elements": [
+    {
+      "id": "hero-title",
+      "type": "text",
+      "gridColumn": 1,
+      "gridRow": 1,
+      "colSpan": 7,
+      "rowSpan": 2,
+      "content": {
+        "tag": "h1",
+        "text": "tayles.studio"
+      }
+    },
+    {
+      "id": "hero-subtitle",
+      "type": "text",
+      "gridColumn": 1,
+      "gridRow": 3,
+      "colSpan": 5,
+      "rowSpan": 1,
+      "content": {
+        "tag": "p",
+        "text": "Creative projects, crafts, and experiments.",
+        "subtext": "Scroll to explore"
+      }
+    },
+    {
+      "id": "hero-image",
+      "type": "image",
+      "gridColumn": 8,
+      "gridRow": 1,
+      "colSpan": 5,
+      "rowSpan": 3,
+      "content": {
+        "src": "/placeholder.svg",
+        "alt": "Studio preview"
+      }
+    },
+    {
+      "id": "embroidery-feature",
+      "type": "split",
+      "gridColumn": 1,
+      "gridRow": 5,
+      "colSpan": 12,
+      "rowSpan": 3,
+      "content": {
+        "ratio": 0.45,
+        "left": {
+          "type": "text",
+          "tag": "h2",
+          "text": "Embroidery",
+          "subtext": "Handcrafted designs and patterns — thread meets pixel."
+        },
+        "right": {
+          "type": "image",
+          "src": "/placeholder.svg",
+          "alt": "Embroidery project preview"
+        }
+      }
+    },
+    {
+      "id": "projects-label",
+      "type": "text",
+      "gridColumn": 1,
+      "gridRow": 9,
+      "colSpan": 4,
+      "rowSpan": 1,
+      "content": {
+        "tag": "h3",
+        "text": "Projects"
+      }
+    },
+    {
+      "id": "project-card-1",
+      "type": "image",
+      "gridColumn": 1,
+      "gridRow": 10,
+      "colSpan": 4,
+      "rowSpan": 3,
+      "content": {
+        "src": "/placeholder.svg",
+        "alt": "Project one",
+        "caption": "Project One"
+      }
+    },
+    {
+      "id": "project-card-2",
+      "type": "image",
+      "gridColumn": 5,
+      "gridRow": 10,
+      "colSpan": 4,
+      "rowSpan": 3,
+      "content": {
+        "src": "/placeholder.svg",
+        "alt": "Project two",
+        "caption": "Project Two"
+      }
+    },
+    {
+      "id": "project-card-3",
+      "type": "image",
+      "gridColumn": 9,
+      "gridRow": 10,
+      "colSpan": 4,
+      "rowSpan": 3,
+      "content": {
+        "src": "/placeholder.svg",
+        "alt": "Project three",
+        "caption": "Project Three"
+      }
+    }
+  ]
+}
