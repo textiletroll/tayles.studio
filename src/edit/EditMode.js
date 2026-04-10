@@ -5,6 +5,8 @@
  */
 
 import { ShapeEditor } from './ShapeEditor.js';
+import { applySplitBoundary } from '../elements/SplitBlock.js';
+import { composeTransform, computeShapeBBox } from '../grid/PegBoard.js';
 
 let _idCounter = 0;
 function uniqueId(prefix) {
@@ -26,6 +28,7 @@ export class EditMode {
     this._onPointerUp = this._onPointerUp.bind(this);
     this._onContextMenu = this._onContextMenu.bind(this);
     this._onDismissMenu = this._onDismissMenu.bind(this);
+    this._onBackgroundPointerDown = this._onBackgroundPointerDown.bind(this);
     this._onDrawMove = this._onDrawMove.bind(this);
     this._onDrawUp = this._onDrawUp.bind(this);
     this._onDrawStart = this._onDrawStart.bind(this);
@@ -51,20 +54,38 @@ export class EditMode {
     this._buildGridOverlay();
     this.board.container.addEventListener('contextmenu', this._onContextMenu);
     document.addEventListener('pointerdown', this._onDismissMenu);
+    document.addEventListener('pointerdown', this._onBackgroundPointerDown);
+
+    // Alt modifier — toggles shape anchor visibility
+    this._onAltDown = (e) => {
+      if (e.key === 'Alt') this.board.container.classList.add('alt-active');
+    };
+    this._onAltUp = (e) => {
+      if (e.key === 'Alt') this.board.container.classList.remove('alt-active');
+    };
+    this._onAltBlur = () => this.board.container.classList.remove('alt-active');
+    document.addEventListener('keydown', this._onAltDown);
+    document.addEventListener('keyup', this._onAltUp);
+    window.addEventListener('blur', this._onAltBlur);
   }
 
   disable() {
     this.active = false;
-    this.board.container.classList.remove('edit-mode');
+    this.board.container.classList.remove('edit-mode', 'alt-active');
     this.toggleBtn.textContent = 'Edit';
     this._detachElementHandlers();
     this._removeGridOverlay();
     this._dismissMenu();
     this._cancelDraw();
     this._shapeEditor.deactivate();
+    this._removeBoundsOverlay();
     this._selectElement(null);
     this.board.container.removeEventListener('contextmenu', this._onContextMenu);
     document.removeEventListener('pointerdown', this._onDismissMenu);
+    document.removeEventListener('pointerdown', this._onBackgroundPointerDown);
+    document.removeEventListener('keydown', this._onAltDown);
+    document.removeEventListener('keyup', this._onAltUp);
+    window.removeEventListener('blur', this._onAltBlur);
     this._saveLayout();
   }
 
@@ -133,18 +154,132 @@ export class EditMode {
     // Deselect previous
     if (this._selectedId) {
       const prev = this.board.elements.get(this._selectedId);
-      if (prev) prev.wrapper.classList.remove('is-selected');
+      if (prev) {
+        prev.wrapper.classList.remove('is-selected');
+        prev.wrapper.classList.remove('has-shape-bounds');
+      }
+    }
+    this._removeBoundsOverlay();
+    if (this._frameEditId && this._frameEditId !== id) {
+      this._exitFrameEdit();
     }
 
     this._selectedId = id;
 
     if (id) {
       const entry = this.board.elements.get(id);
-      if (entry) entry.wrapper.classList.add('is-selected');
+      if (entry) {
+        entry.wrapper.classList.add('is-selected');
+        // For shaped elements, create a bounds overlay outside the clip-path
+        if (entry.config.style?.shape) {
+          this._createBoundsOverlay(id);
+        }
+      }
     }
 
     this._shapeEditor.onSelectionChange(id);
     this._populatePanelEditor();
+  }
+
+  // ── Bounds overlay for shaped elements ──
+  // A dashed rectangle overlay that sits outside the clip-path so resize handles
+  // and shape anchors remain visible and interactive.
+
+  _createBoundsOverlay(id) {
+    this._removeBoundsOverlay();
+    const entry = this.board.elements.get(id);
+    if (!entry) return;
+    const { config, wrapper } = entry;
+
+    // Outer: grid-sized transparent container that inherits the wrapper's transform.
+    // Hosts anchor handles (positioned in grid-local percentages).
+    const overlay = document.createElement('div');
+    overlay.classList.add('shape-bounds');
+    overlay.style.gridColumn = `${config.gridColumn} / span ${config.colSpan || 1}`;
+    overlay.style.gridRow = `${config.gridRow} / span ${config.rowSpan || 1}`;
+
+    // Inner: the visible dashed box that tightly wraps the shape's bbox.
+    // Hosts the resize handles so they sit on the actual visible shape.
+    const box = document.createElement('div');
+    box.classList.add('shape-bounds-box');
+
+    const edges = [
+      'top', 'bottom', 'left', 'right',
+      'top-left', 'top-right', 'bottom-left', 'bottom-right',
+    ];
+    edges.forEach(edge => {
+      const handle = document.createElement('div');
+      handle.classList.add('edit-resize-handle', `edit-resize-${edge}`);
+      handle.addEventListener('pointerdown', (e) => {
+        e.stopPropagation();
+        this._startResize(id, wrapper, edge, e, overlay);
+      });
+      box.appendChild(handle);
+    });
+
+    overlay.appendChild(box);
+    this.board.container.appendChild(overlay);
+    this._boundsOverlay = overlay;
+    this._boundsBox = box;
+    wrapper.classList.add('has-shape-bounds');
+
+    this._syncBoundsOverlay();
+  }
+
+  _removeBoundsOverlay() {
+    if (this._boundsOverlay) {
+      this._boundsOverlay.remove();
+      this._boundsOverlay = null;
+      this._boundsBox = null;
+    }
+  }
+
+  /** Recreate the bounds overlay if the selected element's shape state changed. */
+  _refreshBoundsOverlay() {
+    if (!this._selectedId) return;
+    const entry = this.board.elements.get(this._selectedId);
+    if (!entry) return;
+    const hasShape = !!entry.config.style?.shape;
+    const hasOverlay = !!this._boundsOverlay;
+    if (hasShape && !hasOverlay) {
+      this._createBoundsOverlay(this._selectedId);
+    } else if (!hasShape && hasOverlay) {
+      entry.wrapper.classList.remove('has-shape-bounds');
+      this._removeBoundsOverlay();
+    } else {
+      this._syncBoundsOverlay();
+    }
+  }
+
+  _syncBoundsOverlay() {
+    if (!this._selectedId) return;
+    const config = this.board.elements.get(this._selectedId)?.config;
+    if (!config) return;
+    const gc = `${config.gridColumn} / span ${config.colSpan || 1}`;
+    const gr = `${config.gridRow} / span ${config.rowSpan || 1}`;
+    const transform = composeTransform(config.style);
+
+    if (this._boundsOverlay) {
+      this._boundsOverlay.style.gridColumn = gc;
+      this._boundsOverlay.style.gridRow = gr;
+      this._boundsOverlay.style.transform = transform;
+
+      // Tight bbox for the inner dashed box + resize handles
+      if (this._boundsBox) {
+        const colSpan = config.colSpan || 1;
+        const rowSpan = config.rowSpan || 1;
+        const bbox = computeShapeBBox(config);
+        this._boundsBox.style.left = `${(bbox.x / colSpan) * 100}%`;
+        this._boundsBox.style.top = `${(bbox.y / rowSpan) * 100}%`;
+        this._boundsBox.style.width = `${(bbox.w / colSpan) * 100}%`;
+        this._boundsBox.style.height = `${(bbox.h / rowSpan) * 100}%`;
+      }
+    }
+    if (this._frameOverlay) {
+      this._frameOverlay.style.gridColumn = gc;
+      this._frameOverlay.style.gridRow = gr;
+      this._frameOverlay.style.transform = transform;
+    }
   }
 
   _populatePanelEditor() {
@@ -166,10 +301,28 @@ export class EditMode {
 
     const { config } = entry;
 
-    // Header
+    // Header — type dropdown + id
     const header = document.createElement('div');
     header.classList.add('pe-header');
-    header.textContent = `${config.type} — ${config.id}`;
+
+    const typeSelect = document.createElement('select');
+    typeSelect.classList.add('pe-input', 'pe-type-select');
+    [['text', 'Text'], ['image', 'Image'], ['split', 'Split']].forEach(([val, label]) => {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = label;
+      if (val === config.type) opt.selected = true;
+      typeSelect.appendChild(opt);
+    });
+    typeSelect.addEventListener('change', () => {
+      this._changePanelType(config.id, typeSelect.value);
+    });
+
+    const idLabel = document.createElement('div');
+    idLabel.classList.add('pe-header-id');
+    idLabel.textContent = config.id;
+
+    header.append(typeSelect, idLabel);
     body.appendChild(header);
 
     // Type-specific controls first (the important stuff)
@@ -290,6 +443,96 @@ export class EditMode {
     });
     section.appendChild(this._peField('Subtext', richSub));
 
+    // Horizontal alignment
+    const hAlignSelect = document.createElement('select');
+    hAlignSelect.classList.add('pe-input');
+    ['left', 'center', 'right'].forEach(v => {
+      const opt = document.createElement('option');
+      opt.value = v;
+      opt.textContent = v.charAt(0).toUpperCase() + v.slice(1);
+      if (v === (content.align || 'left')) opt.selected = true;
+      hAlignSelect.appendChild(opt);
+    });
+    hAlignSelect.addEventListener('change', () => {
+      content.align = hAlignSelect.value;
+      this._rebuildSelected();
+    });
+    section.appendChild(this._peField('H align', hAlignSelect));
+
+    // Vertical alignment
+    const vAlignSelect = document.createElement('select');
+    vAlignSelect.classList.add('pe-input');
+    [['top', 'flex-start'], ['center', 'center'], ['bottom', 'flex-end']].forEach(([label, val]) => {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = label.charAt(0).toUpperCase() + label.slice(1);
+      if (val === (content.vAlign || 'center')) opt.selected = true;
+      vAlignSelect.appendChild(opt);
+    });
+    vAlignSelect.addEventListener('change', () => {
+      content.vAlign = vAlignSelect.value;
+      this._rebuildSelected();
+    });
+    section.appendChild(this._peField('V align', vAlignSelect));
+
+    // Text frame section
+    section.appendChild(this._buildTextFrameControls(config));
+
+    return section;
+  }
+
+  _buildTextFrameControls(config) {
+    const content = config.content;
+    if (!content.frame) {
+      content.frame = { x: 0, y: 0, width: 100, height: 100, rotation: 0 };
+    }
+    const f = content.frame;
+    const section = this._peSection('Text Frame', false);
+
+    const rebuild = () => this._rebuildSelected();
+
+    const xInput = this._peNumberInput(f.x, 0, 100, 1, (v) => { f.x = v; rebuild(); });
+    section.appendChild(this._peField('X %', xInput));
+
+    const yInput = this._peNumberInput(f.y, 0, 100, 1, (v) => { f.y = v; rebuild(); });
+    section.appendChild(this._peField('Y %', yInput));
+
+    const wInput = this._peNumberInput(f.width, 5, 100, 1, (v) => { f.width = v; rebuild(); });
+    section.appendChild(this._peField('W %', wInput));
+
+    const hInput = this._peNumberInput(f.height, 5, 100, 1, (v) => { f.height = v; rebuild(); });
+    section.appendChild(this._peField('H %', hInput));
+
+    const rotInput = this._peNumberInput(f.rotation, -180, 180, 1, (v) => { f.rotation = v; rebuild(); });
+    section.appendChild(this._peField('Rotation', rotInput));
+
+    // Clip text toggle
+    const clipCheck = document.createElement('input');
+    clipCheck.type = 'checkbox';
+    clipCheck.checked = !!content.clipFrame;
+    clipCheck.addEventListener('change', () => {
+      content.clipFrame = clipCheck.checked;
+      rebuild();
+    });
+    section.appendChild(this._peField('Clip text', clipCheck));
+
+    const resetBtn = document.createElement('button');
+    resetBtn.classList.add('edit-btn');
+    resetBtn.textContent = 'Reset Frame';
+    resetBtn.style.marginTop = '4px';
+    resetBtn.addEventListener('click', () => {
+      content.frame = { x: 0, y: 0, width: 100, height: 100, rotation: 0 };
+      content.clipFrame = false;
+      this._rebuildSelected();
+      this._populatePanelEditor();
+    });
+    section.appendChild(resetBtn);
+
+    const hint = document.createElement('div');
+    hint.classList.add('pe-hint');
+    hint.textContent = 'Double-click panel to edit frame interactively';
+    section.appendChild(hint);
+
     return section;
   }
 
@@ -365,6 +608,19 @@ export class EditMode {
     });
     section.appendChild(this._peField('Angle', angleInput));
 
+    const blendInput = document.createElement('input');
+    blendInput.type = 'range';
+    blendInput.classList.add('pe-input', 'pe-range');
+    blendInput.min = '0';
+    blendInput.max = '1';
+    blendInput.step = '0.01';
+    blendInput.value = content.blend ?? 0;
+    blendInput.addEventListener('input', () => {
+      content.blend = parseFloat(blendInput.value);
+      this._recomputeSplitClips(config);
+    });
+    section.appendChild(this._peField('Blend', blendInput));
+
     const leftSection = this._peSection('Left side');
     leftSection.appendChild(this._buildSideEditor(config, content.left, 'left'));
     section.appendChild(leftSection);
@@ -391,7 +647,10 @@ export class EditMode {
     typeSelect.addEventListener('change', () => {
       const newType = typeSelect.value;
       if (newType === 'text') {
-        parentConfig.content[side] = { type: 'text', tag: 'h2', text: 'New text' };
+        parentConfig.content[side] = {
+          type: 'text', tag: 'h2', text: 'New text',
+          align: side === 'right' ? 'right' : 'left',
+        };
       } else {
         parentConfig.content[side] = { type: 'image', src: '/placeholder.svg', alt: '' };
       }
@@ -427,6 +686,36 @@ export class EditMode {
         this._rebuildSelected();
       });
       wrap.appendChild(this._peField('Subtext', richSub));
+
+      const hAlignSelect = document.createElement('select');
+      hAlignSelect.classList.add('pe-input');
+      ['left', 'center', 'right'].forEach(v => {
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = v.charAt(0).toUpperCase() + v.slice(1);
+        if (v === (sideContent.align || 'left')) opt.selected = true;
+        hAlignSelect.appendChild(opt);
+      });
+      hAlignSelect.addEventListener('change', () => {
+        sideContent.align = hAlignSelect.value;
+        this._rebuildSelected();
+      });
+      wrap.appendChild(this._peField('H align', hAlignSelect));
+
+      const vAlignSelect = document.createElement('select');
+      vAlignSelect.classList.add('pe-input');
+      [['top', 'flex-start'], ['center', 'center'], ['bottom', 'flex-end']].forEach(([label, val]) => {
+        const opt = document.createElement('option');
+        opt.value = val;
+        opt.textContent = label.charAt(0).toUpperCase() + label.slice(1);
+        if (val === (sideContent.vAlign || 'center')) opt.selected = true;
+        vAlignSelect.appendChild(opt);
+      });
+      vAlignSelect.addEventListener('change', () => {
+        sideContent.vAlign = vAlignSelect.value;
+        this._rebuildSelected();
+      });
+      wrap.appendChild(this._peField('V align', vAlignSelect));
     } else if (sideContent.type === 'image') {
       const srcInput = document.createElement('input');
       srcInput.type = 'text';
@@ -535,12 +824,71 @@ export class EditMode {
       section.appendChild(this._peField('Right opa.', roInput));
     }
 
-    // Background color
-    const bgInput = this._peColorInput(s.bgColor || '#141414', (v) => {
-      s.bgColor = v;
-      applyDesign();
-    });
-    section.appendChild(this._peField('Bg color', bgInput));
+    // Background color(s) — split panels get per-side controls
+    if (config.type === 'split') {
+      const addSideBg = (key, label) => {
+        const transCheck = document.createElement('input');
+        transCheck.type = 'checkbox';
+        transCheck.checked = s[key] === 'transparent';
+        const colorInput = this._peColorInput(
+          s[key] && s[key] !== 'transparent' ? s[key] : '#141414',
+          (v) => {
+            s[key] = v;
+            transCheck.checked = false;
+            applyDesign();
+          }
+        );
+        colorInput.disabled = s[key] === 'transparent';
+        transCheck.addEventListener('change', () => {
+          if (transCheck.checked) {
+            s[key] = 'transparent';
+            colorInput.disabled = true;
+          } else {
+            s[key] = '#141414';
+            colorInput.disabled = false;
+            const text = colorInput.querySelector('.pe-color-text');
+            const picker = colorInput.querySelector('.pe-color-picker');
+            if (text) text.value = '#141414';
+            if (picker) picker.value = '#141414';
+          }
+          applyDesign();
+        });
+        section.appendChild(this._peField(`${label} trans`, transCheck));
+        section.appendChild(this._peField(`${label} bg`, colorInput));
+      };
+      addSideBg('leftBgColor', 'Left');
+      addSideBg('rightBgColor', 'Right');
+    } else {
+      const bgTransCheck = document.createElement('input');
+      bgTransCheck.type = 'checkbox';
+      bgTransCheck.checked = s.bgColor === 'transparent';
+      bgTransCheck.addEventListener('change', () => {
+        if (bgTransCheck.checked) {
+          s.bgColor = 'transparent';
+          bgInput.disabled = true;
+        } else {
+          s.bgColor = '#141414';
+          bgInput.disabled = false;
+          const text = bgInput.querySelector('.pe-color-text');
+          const picker = bgInput.querySelector('.pe-color-picker');
+          if (text) text.value = '#141414';
+          if (picker) picker.value = '#141414';
+        }
+        applyDesign();
+      });
+      section.appendChild(this._peField('Transparent', bgTransCheck));
+
+      const bgInput = this._peColorInput(
+        s.bgColor && s.bgColor !== 'transparent' ? s.bgColor : '#141414',
+        (v) => {
+          s.bgColor = v;
+          bgTransCheck.checked = false;
+          applyDesign();
+        }
+      );
+      bgInput.disabled = s.bgColor === 'transparent';
+      section.appendChild(this._peField('Bg color', bgInput));
+    }
 
     // Text color
     const tcInput = this._peColorInput(s.textColor || '#e8e8e8', (v) => {
@@ -554,7 +902,7 @@ export class EditMode {
 
   // ── Panel editor helpers ──
 
-  _peSection(title, startOpen = true) {
+  _peSection(title, startOpen = false) {
     const section = document.createElement('div');
     section.classList.add('pe-section');
 
@@ -648,21 +996,270 @@ export class EditMode {
     this.board.rebuildElement(this._selectedId);
   }
 
+  _changePanelType(id, newType) {
+    const entry = this.board.elements.get(id);
+    if (!entry || entry.config.type === newType) return;
+
+    this._exitFrameEdit();
+
+    const defaults = {
+      text: { tag: 'h2', text: 'New text' },
+      image: { src: '/placeholder.svg', alt: 'New image' },
+      split: {
+        ratio: 0.5, angle: 0,
+        left: { type: 'text', tag: 'h2', text: 'Left' },
+        right: { type: 'image', src: '/placeholder.svg', alt: 'Right' },
+      },
+    };
+
+    entry.config.type = newType;
+    entry.config.content = defaults[newType];
+    entry.wrapper.dataset.type = newType;
+
+    this.board.rebuildElement(id);
+    this._populatePanelEditor();
+  }
+
+  // ── Text frame interactive editing ──
+
+  _enterFrameEdit(id) {
+    this._exitFrameEdit();
+    const entry = this.board.elements.get(id);
+    if (!entry || entry.config.type !== 'text') return;
+    this._frameEditId = id;
+    // Hide bounds overlay resize handles so they don't intercept frame handles
+    if (this._boundsOverlay) this._boundsOverlay.classList.add('frame-editing');
+    this._showFrameHandles(id);
+  }
+
+  _exitFrameEdit() {
+    if (this._boundsOverlay) this._boundsOverlay.classList.remove('frame-editing');
+    if (this._frameOverlay) {
+      this._frameOverlay.remove();
+      this._frameOverlay = null;
+    }
+    this._frameEditId = null;
+  }
+
+  _showFrameHandles(id) {
+    // Remove old overlay
+    if (this._frameOverlay) {
+      this._frameOverlay.remove();
+      this._frameOverlay = null;
+    }
+
+    const entry = this.board.elements.get(id);
+    if (!entry) return;
+    const { config, wrapper } = entry;
+    const content = config.content;
+    if (!content.frame) {
+      content.frame = { x: 0, y: 0, width: 100, height: 100, rotation: 0 };
+    }
+    const f = content.frame;
+
+    // Create frame overlay as a grid sibling (not a wrapper child)
+    // so it's never clipped by overflow:hidden or clip-path
+    const container = document.createElement('div');
+    container.classList.add('text-frame-container');
+    container.style.gridColumn = `${config.gridColumn} / span ${config.colSpan || 1}`;
+    container.style.gridRow = `${config.gridRow} / span ${config.rowSpan || 1}`;
+    container.style.transform = composeTransform(config.style);
+
+    const overlay = document.createElement('div');
+    overlay.classList.add('text-frame-overlay');
+    overlay.style.left = `${f.x}%`;
+    overlay.style.top = `${f.y}%`;
+    overlay.style.width = `${f.width}%`;
+    overlay.style.height = `${f.height}%`;
+    if (f.rotation) overlay.style.transform = `rotate(${f.rotation}deg)`;
+
+    // Drag to reposition
+    overlay.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      if (e.target.closest('.frame-resize-handle') || e.target.closest('.frame-rotate-handle')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this._startFrameDrag(id, overlay, e);
+    });
+
+    // Resize handles (4 corners)
+    ['top-left', 'top-right', 'bottom-left', 'bottom-right'].forEach(corner => {
+      const handle = document.createElement('div');
+      handle.classList.add('frame-resize-handle', `frame-resize-${corner}`);
+      handle.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this._startFrameResize(id, overlay, corner, e);
+      });
+      overlay.appendChild(handle);
+    });
+
+    // Rotate handle (top center, above the frame)
+    const rotHandle = document.createElement('div');
+    rotHandle.classList.add('frame-rotate-handle');
+    rotHandle.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this._startFrameRotate(id, overlay, e);
+    });
+    overlay.appendChild(rotHandle);
+
+    container.appendChild(overlay);
+    this.board.container.appendChild(container);
+    this._frameOverlay = container;
+  }
+
+  /** Update the .block-text element's frame styles without a full rebuild. */
+  _applyFrameStyle(id) {
+    const entry = this.board.elements.get(id);
+    if (!entry) return;
+    const el = entry.element;
+    const f = entry.config.content.frame;
+    if (!el || !f) return;
+    if (f.x || f.y || f.width !== 100 || f.height !== 100 || f.rotation) {
+      el.style.position = 'absolute';
+      el.style.left = `${f.x}%`;
+      el.style.top = `${f.y}%`;
+      el.style.width = `${f.width}%`;
+      el.style.height = `${f.height}%`;
+      el.style.transform = f.rotation ? `rotate(${f.rotation}deg)` : '';
+    } else {
+      el.style.position = '';
+      el.style.left = '';
+      el.style.top = '';
+      el.style.width = '';
+      el.style.height = '';
+      el.style.transform = '';
+    }
+  }
+
+  _startFrameDrag(id, overlay, e) {
+    const entry = this.board.elements.get(id);
+    if (!entry) return;
+    const wrapper = entry.wrapper;
+    const f = entry.config.content.frame;
+    const rect = wrapper.getBoundingClientRect();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startFx = f.x;
+    const startFy = f.y;
+
+    overlay.setPointerCapture(e.pointerId);
+
+    const onMove = (me) => {
+      const dx = ((me.clientX - startX) / rect.width) * 100;
+      const dy = ((me.clientY - startY) / rect.height) * 100;
+      f.x = Math.round(Math.max(0, Math.min(100 - f.width, startFx + dx)));
+      f.y = Math.round(Math.max(0, Math.min(100 - f.height, startFy + dy)));
+      overlay.style.left = `${f.x}%`;
+      overlay.style.top = `${f.y}%`;
+      this._applyFrameStyle(id);
+    };
+
+    const onUp = () => {
+      overlay.removeEventListener('pointermove', onMove);
+      overlay.removeEventListener('pointerup', onUp);
+      this._populatePanelEditor();
+    };
+
+    overlay.addEventListener('pointermove', onMove);
+    overlay.addEventListener('pointerup', onUp);
+  }
+
+  _startFrameResize(id, overlay, corner, e) {
+    const entry = this.board.elements.get(id);
+    if (!entry) return;
+    const wrapper = entry.wrapper;
+    const f = entry.config.content.frame;
+    const rect = wrapper.getBoundingClientRect();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startFx = f.x;
+    const startFy = f.y;
+    const startFw = f.width;
+    const startFh = f.height;
+
+    overlay.setPointerCapture(e.pointerId);
+
+    const onMove = (me) => {
+      const dx = ((me.clientX - startX) / rect.width) * 100;
+      const dy = ((me.clientY - startY) / rect.height) * 100;
+
+      if (corner.includes('right')) {
+        f.width = Math.round(Math.max(5, Math.min(100 - f.x, startFw + dx)));
+      }
+      if (corner.includes('left')) {
+        const newX = Math.max(0, startFx + dx);
+        const newW = startFw - (newX - startFx);
+        if (newW >= 5) { f.x = Math.round(newX); f.width = Math.round(newW); }
+      }
+      if (corner.includes('bottom')) {
+        f.height = Math.round(Math.max(5, Math.min(100 - f.y, startFh + dy)));
+      }
+      if (corner.includes('top')) {
+        const newY = Math.max(0, startFy + dy);
+        const newH = startFh - (newY - startFy);
+        if (newH >= 5) { f.y = Math.round(newY); f.height = Math.round(newH); }
+      }
+
+      overlay.style.left = `${f.x}%`;
+      overlay.style.top = `${f.y}%`;
+      overlay.style.width = `${f.width}%`;
+      overlay.style.height = `${f.height}%`;
+      this._applyFrameStyle(id);
+    };
+
+    const onUp = () => {
+      overlay.removeEventListener('pointermove', onMove);
+      overlay.removeEventListener('pointerup', onUp);
+      this._populatePanelEditor();
+    };
+
+    overlay.addEventListener('pointermove', onMove);
+    overlay.addEventListener('pointerup', onUp);
+  }
+
+  _startFrameRotate(id, overlay, e) {
+    const entry = this.board.elements.get(id);
+    if (!entry) return;
+    const wrapper = entry.wrapper;
+    const f = entry.config.content.frame;
+    const rect = wrapper.getBoundingClientRect();
+
+    // Center of the frame in viewport coords
+    const cx = rect.left + (f.x + f.width / 2) / 100 * rect.width;
+    const cy = rect.top + (f.y + f.height / 2) / 100 * rect.height;
+
+    overlay.setPointerCapture(e.pointerId);
+
+    const onMove = (me) => {
+      const angle = Math.atan2(me.clientY - cy, me.clientX - cx) * (180 / Math.PI) + 90;
+      f.rotation = Math.round(angle);
+      overlay.style.transform = `rotate(${f.rotation}deg)`;
+      this._applyFrameStyle(id);
+    };
+
+    const onUp = () => {
+      overlay.removeEventListener('pointermove', onMove);
+      overlay.removeEventListener('pointerup', onUp);
+      this._populatePanelEditor();
+    };
+
+    overlay.addEventListener('pointermove', onMove);
+    overlay.addEventListener('pointerup', onUp);
+  }
+
   _recomputeSplitClips(config) {
     const entry = this.board.elements.get(config.id);
     if (!entry) return;
     const { wrapper } = entry;
-    const { ratio = 0.5, angle = 0 } = config.content;
-
-    const angleRad = (angle * Math.PI) / 180;
-    const offset = Math.tan(angleRad) * 50;
-    const topPct = Math.max(0, Math.min(100, ratio * 100 + offset));
-    const bottomPct = Math.max(0, Math.min(100, ratio * 100 - offset));
+    const { ratio = 0.5, angle = 0, blend = 0 } = config.content;
 
     const leftSide = wrapper.querySelector('.split-left');
     const rightSide = wrapper.querySelector('.split-right');
-    if (leftSide) leftSide.style.clipPath = `polygon(0% 0%, ${topPct}% 0%, ${bottomPct}% 100%, 0% 100%)`;
-    if (rightSide) rightSide.style.clipPath = `polygon(${topPct}% 0%, 100% 0%, 100% 100%, ${bottomPct}% 100%)`;
+    if (leftSide && rightSide) {
+      applySplitBoundary(leftSide, rightSide, ratio, angle, blend);
+    }
   }
 
   // ── Grid overlay (vertical + horizontal lines) ──
@@ -734,6 +1331,8 @@ export class EditMode {
       if (e.button !== 0) return;
       if (e.target.closest('.edit-resize-handle')) return;
       if (e.target.closest('.shape-anchor')) return;
+      if (e.target.closest('.text-frame-overlay')) return; // frame handles itself
+      if (e.target.closest('.frame-resize-handle') || e.target.closest('.frame-rotate-handle')) return;
 
       // Alt+Click: add shape anchor
       if (e.altKey) {
@@ -742,20 +1341,41 @@ export class EditMode {
         return;
       }
 
-      // Select on click
+      // Select on click — exit frame edit if clicking panel body
+      if (this._frameEditId === config.id) {
+        this._exitFrameEdit();
+        e.preventDefault();
+        return;
+      }
+
       this._selectElement(config.id);
       this._startDrag(config.id, wrapper, e);
     }, true);
+
+    // Double-click on text panel enters frame edit mode
+    if (config.type === 'text') {
+      wrapper.addEventListener('dblclick', wrapper._editFrameStart = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this._selectElement(config.id);
+        this._enterFrameEdit(config.id);
+      });
+    }
 
     this._addResizeHandles(wrapper, config.id);
   }
 
   _detachElementHandlers() {
+    this._exitFrameEdit();
     this.board.elements.forEach(({ wrapper }) => {
       wrapper.classList.remove('edit-element', 'is-selected');
       if (wrapper._editDragStart) {
         wrapper.removeEventListener('pointerdown', wrapper._editDragStart, true);
         delete wrapper._editDragStart;
+      }
+      if (wrapper._editFrameStart) {
+        wrapper.removeEventListener('dblclick', wrapper._editFrameStart);
+        delete wrapper._editFrameStart;
       }
       wrapper.querySelectorAll('.edit-resize-handle').forEach(h => h.remove());
     });
@@ -805,6 +1425,7 @@ export class EditMode {
     wrapper.style.gridRow = `${row} / span ${config.rowSpan || 1}`;
     config.gridColumn = col;
     config.gridRow = row;
+    this._syncBoundsOverlay();
   }
 
   _finishDrag(e) {
@@ -837,13 +1458,20 @@ export class EditMode {
     });
   }
 
-  _startResize(id, wrapper, edge, e) {
+  _startResize(id, wrapper, edge, e, captureEl) {
     e.preventDefault();
     const config = this.board.elements.get(id).config;
+    const el = captureEl || wrapper;
+    // Snapshot anchor positions so we can scale from originals during drag
+    const origAnchors = config.style?.shape?.anchors
+      ? config.style.shape.anchors.map(a => ({ x: a.x, y: a.y }))
+      : null;
     this.resizing = {
       id,
       wrapper,
       edge,
+      captureEl: el,
+      origAnchors,
       startX: e.clientX,
       startY: e.clientY,
       startCol: config.gridColumn,
@@ -852,9 +1480,9 @@ export class EditMode {
       startRowSpan: config.rowSpan || 1,
     };
     wrapper.classList.add('is-resizing');
-    wrapper.setPointerCapture(e.pointerId);
-    wrapper.addEventListener('pointermove', this._onPointerMove);
-    wrapper.addEventListener('pointerup', this._onPointerUp);
+    el.setPointerCapture(e.pointerId);
+    el.addEventListener('pointermove', this._onPointerMove);
+    el.addEventListener('pointerup', this._onPointerUp);
   }
 
   _handleResizeMove(e) {
@@ -899,21 +1527,52 @@ export class EditMode {
 
     wrapper.style.gridColumn = `${config.gridColumn} / span ${config.colSpan}`;
     wrapper.style.gridRow = `${config.gridRow} / span ${config.rowSpan}`;
+    this._syncBoundsOverlay();
+
+    // Live preview for shaped elements — scale anchors from originals and re-render
+    const { origAnchors } = this.resizing;
+    if (origAnchors && config.style?.shape?.anchors) {
+      const xScale = config.colSpan / startColSpan;
+      const yScale = config.rowSpan / startRowSpan;
+      origAnchors.forEach((orig, i) => {
+        config.style.shape.anchors[i] = {
+          x: orig.x * xScale,
+          y: orig.y * yScale,
+        };
+      });
+      this.board.applyDesign(id);
+    }
   }
 
   _finishResize(e) {
-    const { wrapper } = this.resizing;
+    const { wrapper, captureEl, startColSpan, startRowSpan } = this.resizing;
+    const el = captureEl || wrapper;
     wrapper.classList.remove('is-resizing');
-    wrapper.releasePointerCapture(e.pointerId);
-    wrapper.removeEventListener('pointermove', this._onPointerMove);
-    wrapper.removeEventListener('pointerup', this._onPointerUp);
+    el.releasePointerCapture(e.pointerId);
+    el.removeEventListener('pointermove', this._onPointerMove);
+    el.removeEventListener('pointerup', this._onPointerUp);
     this.resizing = null;
-    // Re-apply shape and handles after resize changes dimensions
+
+    // Snap scaled anchors to half-grid after resize
     const resizedEntry = this.board.elements.get(this._selectedId);
+    if (resizedEntry?.config.style?.shape?.anchors) {
+      const config = resizedEntry.config;
+      const newColSpan = config.colSpan || 1;
+      const newRowSpan = config.rowSpan || 1;
+      config.style.shape.anchors.forEach(a => {
+        a.x = Math.round(a.x * 2) / 2;
+        a.y = Math.round(a.y * 2) / 2;
+        a.x = Math.max(0, Math.min(newColSpan, a.x));
+        a.y = Math.max(0, Math.min(newRowSpan, a.y));
+      });
+    }
+
+    // Re-apply shape and handles after resize changes dimensions
     if (resizedEntry?.config.style?.shape) {
       this.board.applyDesign(this._selectedId);
       this._shapeEditor.onSelectionChange(this._selectedId);
     }
+    this._syncBoundsOverlay();
     this._populatePanelEditor();
   }
 
@@ -942,6 +1601,14 @@ export class EditMode {
         { label: 'Send to back', action: () => { this._setLayer(id, 'back'); this._dismissMenu(); } },
       ]);
 
+      this._addSubmenu(menu, 'Transform', [
+        { label: 'Rotate 90° CW', action: () => { this._applyTransform(id, 'rotate', 90); this._dismissMenu(); } },
+        { label: 'Rotate 90° CCW', action: () => { this._applyTransform(id, 'rotate', -90); this._dismissMenu(); } },
+        { label: 'Flip horizontal', action: () => { this._applyTransform(id, 'flipX'); this._dismissMenu(); } },
+        { label: 'Flip vertical', action: () => { this._applyTransform(id, 'flipY'); this._dismissMenu(); } },
+        { label: 'Reset', action: () => { this._applyTransform(id, 'reset'); this._dismissMenu(); } },
+      ]);
+
       this._addMenuItem(menu, 'Duplicate panel', () => {
         const entry = this.board.elements.get(id);
         if (entry) {
@@ -958,11 +1625,7 @@ export class EditMode {
         this._dismissMenu();
       });
 
-      this._addMenuItem(menu, 'Delete panel', () => {
-        this.board.removeElement(id);
-        if (this._selectedId === id) this._selectElement(null);
-        this._dismissMenu();
-      });
+      this._addDeleteConfirmItem(menu, id);
     } else {
       const shapes = ['Rectangle', 'Circle', 'Triangle'];
       const types = [
@@ -993,6 +1656,58 @@ export class EditMode {
       e.stopPropagation();
       onClick();
     });
+    menu.appendChild(item);
+  }
+
+  /** Delete menu item with inline confirm (✓ / ✕) to prevent accidental deletion. */
+  _addDeleteConfirmItem(menu, id) {
+    const item = document.createElement('div');
+    item.classList.add('edit-context-item');
+
+    const onDefaultClick = (e) => {
+      e.stopPropagation();
+      showConfirm();
+    };
+
+    const showDefault = () => {
+      item.removeEventListener('pointerup', onDefaultClick);
+      item.innerHTML = '';
+      item.classList.remove('edit-context-confirm');
+      item.textContent = 'Delete panel';
+      item.addEventListener('pointerup', onDefaultClick);
+    };
+
+    const showConfirm = () => {
+      item.removeEventListener('pointerup', onDefaultClick);
+      item.innerHTML = '';
+      item.classList.add('edit-context-confirm');
+
+      const label = document.createElement('span');
+      label.classList.add('edit-context-confirm-label');
+      label.textContent = 'Delete?';
+
+      const yes = document.createElement('span');
+      yes.classList.add('edit-context-confirm-btn', 'is-yes');
+      yes.textContent = '\u2713';
+      yes.addEventListener('pointerup', (ev) => {
+        ev.stopPropagation();
+        this.board.removeElement(id);
+        if (this._selectedId === id) this._selectElement(null);
+        this._dismissMenu();
+      });
+
+      const no = document.createElement('span');
+      no.classList.add('edit-context-confirm-btn', 'is-no');
+      no.textContent = '\u2715';
+      no.addEventListener('pointerup', (ev) => {
+        ev.stopPropagation();
+        showDefault();
+      });
+
+      item.append(label, yes, no);
+    };
+
+    showDefault();
     menu.appendChild(item);
   }
 
@@ -1028,6 +1743,17 @@ export class EditMode {
     if (this._contextMenu && !this._contextMenu.contains(e.target)) {
       this._dismissMenu();
     }
+  }
+
+  _onBackgroundPointerDown(e) {
+    if (e.button !== 0) return;
+    if (!this._selectedId) return;
+    if (this.dragging || this.resizing) return;
+    if (e.target.closest(
+      '.peg-element, .shape-bounds, .text-frame-overlay, .shape-anchor, ' +
+      '.edit-context-menu, .panel-editor, .edit-bar'
+    )) return;
+    this._selectElement(null);
   }
 
   _dismissMenu() {
@@ -1144,6 +1870,7 @@ export class EditMode {
       config.style.shape = { preset: 'circle' };
     } else if (shapePreset === 'triangle') {
       config.style.shape = {
+        preset: 'triangle',
         anchors: [
           { x: colSpan / 2, y: 0 },
           { x: colSpan, y: rowSpan },
@@ -1195,6 +1922,31 @@ export class EditMode {
     }
 
     entry.wrapper.style.zIndex = entry.config.zIndex;
+  }
+
+  // ── Panel transform (rotate 90° steps + flips) ──
+
+  _applyTransform(id, op, value) {
+    const entry = this.board.elements.get(id);
+    if (!entry) return;
+    if (!entry.config.style) entry.config.style = {};
+    const s = entry.config.style;
+
+    if (op === 'rotate') {
+      const current = s.rotation || 0;
+      s.rotation = ((current + value) % 360 + 360) % 360;
+    } else if (op === 'flipX') {
+      s.flipX = !s.flipX;
+    } else if (op === 'flipY') {
+      s.flipY = !s.flipY;
+    } else if (op === 'reset') {
+      s.rotation = 0;
+      s.flipX = false;
+      s.flipY = false;
+    }
+
+    this.board.applyDesign(id);
+    if (this._selectedId === id) this._syncBoundsOverlay();
   }
 
   // ── Cell math ──

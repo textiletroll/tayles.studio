@@ -63,17 +63,31 @@ export class ShapeEditor {
     gx = proj.x;
     gy = proj.y;
 
-    // Auto-create default rectangle anchors if shape doesn't exist yet
+    // Auto-create default anchors if shape doesn't have them yet
     if (!config.style.shape || !config.style.shape.anchors || config.style.shape.anchors.length < 3) {
-      config.style.shape = {
-        anchors: [
-          { x: 0, y: 0 },
-          { x: colSpan, y: 0 },
-          { x: colSpan, y: rowSpan },
-          { x: 0, y: rowSpan },
-        ],
-        smooth: false,
-      };
+      const wasCircle = config.style.shape?.preset === 'circle';
+      if (wasCircle) {
+        // Convert circle to 4-point diamond with smooth curves
+        config.style.shape = {
+          anchors: [
+            { x: colSpan / 2, y: 0 },
+            { x: colSpan, y: rowSpan / 2 },
+            { x: colSpan / 2, y: rowSpan },
+            { x: 0, y: rowSpan / 2 },
+          ],
+          smooth: true,
+        };
+      } else {
+        config.style.shape = {
+          anchors: [
+            { x: 0, y: 0 },
+            { x: colSpan, y: 0 },
+            { x: colSpan, y: rowSpan },
+            { x: 0, y: rowSpan },
+          ],
+          smooth: false,
+        };
+      }
     }
 
     // Don't add duplicate
@@ -85,6 +99,7 @@ export class ShapeEditor {
     anchors.splice(idx, 0, { x: gx, y: gy });
 
     this.board.applyDesign(config.id);
+    this.editMode._refreshBoundsOverlay();
     this._activeId = id;
     this._renderHandles();
     this.editMode._populatePanelEditor();
@@ -98,6 +113,7 @@ export class ShapeEditor {
     if (anchors.length <= 3) return; // minimum 3
     anchors.splice(index, 1);
     this.board.applyDesign(config.id);
+    this.editMode._syncBoundsOverlay();
     this._renderHandles();
     this.editMode._populatePanelEditor();
   }
@@ -109,6 +125,7 @@ export class ShapeEditor {
     const section = this.editMode._peSection('Shape', false);
     const applyDesign = () => {
       this.board.applyDesign(config.id);
+      this.editMode._syncBoundsOverlay();
       this._renderHandles();
     };
 
@@ -119,19 +136,28 @@ export class ShapeEditor {
     if (isCircle) {
       section.appendChild(this.editMode._peReadonly('Type', 'Circle'));
 
-      // Reset button
+      // Reset button — restore default circle
       const resetBtn = document.createElement('button');
       resetBtn.classList.add('edit-btn');
       resetBtn.textContent = 'Reset Shape';
       resetBtn.style.marginTop = '4px';
       resetBtn.addEventListener('click', () => {
-        delete s.shape;
+        s.shape = { preset: 'circle' };
         this.deactivate();
         this.board.applyDesign(config.id);
+        this.editMode._refreshBoundsOverlay();
         this.editMode._populatePanelEditor();
       });
       section.appendChild(resetBtn);
+
+      // Remove shape button
+      section.appendChild(this._removeShapeBtn(config));
     } else if (hasAnchors) {
+      const preset = shape.preset;
+      if (preset) {
+        section.appendChild(this.editMode._peReadonly('Type', preset.charAt(0).toUpperCase() + preset.slice(1)));
+      }
+
       // Smooth toggle
       const smoothCheck = document.createElement('input');
       smoothCheck.type = 'checkbox';
@@ -145,47 +171,31 @@ export class ShapeEditor {
       // Anchor count
       section.appendChild(this.editMode._peReadonly('Anchors', `${shape.anchors.length}`));
 
-      // Reset button
+      // Reset button — restore preset default or rectangle anchors
       const resetBtn = document.createElement('button');
       resetBtn.classList.add('edit-btn');
       resetBtn.textContent = 'Reset Shape';
       resetBtn.style.marginTop = '4px';
       resetBtn.addEventListener('click', () => {
-        delete s.shape;
-        this.deactivate();
-        this.board.applyDesign(config.id);
-        this.editMode._populatePanelEditor();
-      });
-      section.appendChild(resetBtn);
-    } else {
-      // Init button
-      const initBtn = document.createElement('button');
-      initBtn.classList.add('edit-btn');
-      initBtn.textContent = 'Initialize Shape';
-      initBtn.addEventListener('click', () => {
         const colSpan = config.colSpan || 1;
         const rowSpan = config.rowSpan || 1;
-        s.shape = {
-          anchors: [
-            { x: 0, y: 0 },
-            { x: colSpan, y: 0 },
-            { x: colSpan, y: rowSpan },
-            { x: 0, y: rowSpan },
-          ],
-          smooth: false,
-        };
+        s.shape = this._defaultShape(preset, colSpan, rowSpan);
         this.board.applyDesign(config.id);
+        this.editMode._refreshBoundsOverlay();
         this._activeId = config.id;
         this._renderHandles();
         this.editMode._populatePanelEditor();
       });
-      section.appendChild(initBtn);
+      section.appendChild(resetBtn);
+
+      // Remove shape button
+      section.appendChild(this._removeShapeBtn(config));
     }
 
     // Hint
     const hint = document.createElement('div');
     hint.classList.add('pe-hint');
-    hint.textContent = 'Alt+Click on panel edge to add anchors';
+    hint.textContent = 'Hold Alt to show anchors · Alt+Click edge to add';
     section.appendChild(hint);
 
     return section;
@@ -227,7 +237,9 @@ export class ShapeEditor {
         this._removeAnchor(i);
       });
 
-      wrapper.appendChild(handle);
+      // Append to bounds overlay if available (avoids clip-path clipping)
+      const parent = this.editMode._boundsOverlay || wrapper;
+      parent.appendChild(handle);
       this._handles.push(handle);
     });
   }
@@ -265,6 +277,7 @@ export class ShapeEditor {
 
       // Re-apply clip in real-time
       this.board.applyDesign(config.id);
+      this.editMode._syncBoundsOverlay();
     };
 
     const onUp = () => {
@@ -276,6 +289,50 @@ export class ShapeEditor {
 
     handle.addEventListener('pointermove', onMove);
     handle.addEventListener('pointerup', onUp);
+  }
+
+  // ── Shape preset helpers ──
+
+  /** Return the default shape data for a given preset (or rectangle if none). */
+  _defaultShape(preset, colSpan, rowSpan) {
+    if (preset === 'circle') return { preset: 'circle' };
+    if (preset === 'triangle') {
+      return {
+        preset: 'triangle',
+        anchors: [
+          { x: colSpan / 2, y: 0 },
+          { x: colSpan, y: rowSpan },
+          { x: 0, y: rowSpan },
+        ],
+        smooth: false,
+      };
+    }
+    // Default rectangle
+    return {
+      anchors: [
+        { x: 0, y: 0 },
+        { x: colSpan, y: 0 },
+        { x: colSpan, y: rowSpan },
+        { x: 0, y: rowSpan },
+      ],
+      smooth: false,
+    };
+  }
+
+  /** Create a "Remove Shape" button that strips shape data entirely. */
+  _removeShapeBtn(config) {
+    const btn = document.createElement('button');
+    btn.classList.add('edit-btn');
+    btn.textContent = 'Remove Shape';
+    btn.style.marginTop = '4px';
+    btn.addEventListener('click', () => {
+      delete config.style.shape;
+      this.deactivate();
+      this.board.applyDesign(config.id);
+      this.editMode._refreshBoundsOverlay();
+      this.editMode._populatePanelEditor();
+    });
+    return btn;
   }
 
   // ── Geometry helpers ──

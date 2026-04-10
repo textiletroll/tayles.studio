@@ -8,6 +8,39 @@ const elementFactories = {
   split: createSplitBlock,
 };
 
+/** Compose a CSS transform string from a style object's rotation/flipX/flipY. */
+export function composeTransform(style) {
+  const rot = style?.rotation || 0;
+  const sx = style?.flipX ? -1 : 1;
+  const sy = style?.flipY ? -1 : 1;
+  const parts = [];
+  if (sx !== 1 || sy !== 1) parts.push(`scale(${sx}, ${sy})`);
+  if (rot !== 0) parts.push(`rotate(${rot}deg)`);
+  return parts.join(' ');
+}
+
+/**
+ * Compute the axis-aligned bounding box of a shape in grid-local units.
+ * Returns { x, y, w, h } where all values are in grid cells.
+ * For unshaped or circle-preset panels, returns the full footprint.
+ */
+export function computeShapeBBox(config) {
+  const colSpan = config.colSpan || 1;
+  const rowSpan = config.rowSpan || 1;
+  const shape = config.style?.shape;
+  if (!shape || shape.preset === 'circle' || !shape.anchors || shape.anchors.length < 3) {
+    return { x: 0, y: 0, w: colSpan, h: rowSpan };
+  }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const a of shape.anchors) {
+    if (a.x < minX) minX = a.x;
+    if (a.x > maxX) maxX = a.x;
+    if (a.y < minY) minY = a.y;
+    if (a.y > maxY) maxY = a.y;
+  }
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
 export class PegBoard {
   constructor(container, options = {}) {
     this.container = container;
@@ -129,8 +162,13 @@ export class PegBoard {
     // Opacity
     wrapper.style.opacity = s.opacity ?? 1;
 
-    // Background color
-    if (s.bgColor) {
+    // Transform — rotation in 90° steps + flips
+    wrapper.style.transform = composeTransform(s);
+
+    // Background color — split panels use per-side colors instead
+    if (config.type === 'split') {
+      wrapper.style.background = '';
+    } else if (s.bgColor) {
       wrapper.style.background = s.bgColor;
     } else {
       wrapper.style.background = '';
@@ -143,12 +181,29 @@ export class PegBoard {
       wrapper.style.color = '';
     }
 
-    // Split side opacity
+    // Clip frame — hide text that overflows the panel
+    if (config.content?.clipFrame) {
+      wrapper.style.overflow = 'hidden';
+    } else {
+      wrapper.style.overflow = '';
+    }
+
+    // Split side opacity and background
     if (config.type === 'split') {
       const left = wrapper.querySelector('.split-left');
       const right = wrapper.querySelector('.split-right');
-      if (left) left.style.opacity = s.leftOpacity ?? 1;
-      if (right) right.style.opacity = s.rightOpacity ?? 1;
+      if (left) {
+        left.style.opacity = s.leftOpacity ?? 1;
+        left.style.background = s.leftBgColor && s.leftBgColor !== 'transparent'
+          ? s.leftBgColor
+          : '';
+      }
+      if (right) {
+        right.style.opacity = s.rightOpacity ?? 1;
+        right.style.background = s.rightBgColor && s.rightBgColor !== 'transparent'
+          ? s.rightBgColor
+          : '';
+      }
     }
 
     // Custom shape

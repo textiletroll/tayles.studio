@@ -87,7 +87,7 @@ img {
   overflow: visible;
 }
 
-/* Shape editor anchor handles */
+/* Shape editor anchor handles — hidden until Alt is held */
 .shape-anchor {
   position: absolute;
   width: 10px;
@@ -98,19 +98,29 @@ img {
   border-radius: 50%;
   cursor: grab;
   z-index: 6;
+  pointer-events: none;
+  opacity: 0;
+  transition: transform 0.1s, opacity 0.15s;
+}
+
+/* Show anchors when Alt is held */
+.edit-mode.alt-active .shape-anchor {
+  opacity: 1;
   pointer-events: auto;
-  transition: transform 0.1s;
 }
 
-.shape-anchor:hover {
-  transform: scale(1.4);
-  background: #8aabff;
-}
-
+/* Keep visible while actively dragging (even if Alt released mid-drag) */
 .shape-anchor.is-dragging {
+  opacity: 1;
+  pointer-events: auto;
   cursor: grabbing;
   transform: scale(1.5);
   background: #a0bdff;
+}
+
+.edit-mode.alt-active .shape-anchor:hover {
+  transform: scale(1.4);
+  background: #8aabff;
 }
 
 .pe-hint {
@@ -173,6 +183,58 @@ img {
 
 .block-text a:hover {
   color: #8aabff;
+}
+
+/* ── Text Frame overlay (edit mode) ── */
+
+.text-frame-container {
+  position: relative;
+  pointer-events: none;
+  z-index: 5;
+  overflow: visible;
+  transform-origin: center center;
+}
+
+.text-frame-overlay {
+  position: absolute;
+  border: 2px dashed rgba(100, 255, 140, 0.6);
+  z-index: 7;
+  cursor: move;
+  box-sizing: border-box;
+  pointer-events: auto;
+}
+
+.frame-resize-handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  background: rgba(100, 255, 140, 0.8);
+  border: 2px solid #fff;
+  border-radius: 2px;
+  z-index: 8;
+}
+
+.frame-resize-top-left { top: -5px; left: -5px; cursor: nwse-resize; }
+.frame-resize-top-right { top: -5px; right: -5px; cursor: nesw-resize; }
+.frame-resize-bottom-left { bottom: -5px; left: -5px; cursor: nesw-resize; }
+.frame-resize-bottom-right { bottom: -5px; right: -5px; cursor: nwse-resize; }
+
+.frame-rotate-handle {
+  position: absolute;
+  top: -24px;
+  left: 50%;
+  margin-left: -6px;
+  width: 12px;
+  height: 12px;
+  background: rgba(100, 255, 140, 0.8);
+  border: 2px solid #fff;
+  border-radius: 50%;
+  cursor: grab;
+  z-index: 8;
+}
+
+.frame-rotate-handle:active {
+  cursor: grabbing;
 }
 
 /* ── Image Block ── */
@@ -389,6 +451,44 @@ img {
   outline: 2px solid rgba(100, 140, 255, 0.7);
 }
 
+/* Suppress outline on shaped elements — the bounds overlay replaces it */
+.edit-element.is-selected.has-shape-bounds {
+  outline: none;
+}
+
+/* Bounds overlay — transparent grid-sized container that inherits the wrapper's transform.
+   Hosts the anchor handles and the tight-bbox inner box. */
+.shape-bounds {
+  position: relative;
+  pointer-events: none;
+  z-index: 4;
+  transform-origin: center center;
+}
+
+/* Inner box — tight dashed rectangle around the shape's actual bbox.
+   Holds the resize handles. */
+.shape-bounds-box {
+  position: absolute;
+  border: 2px dashed rgba(100, 140, 255, 0.5);
+  pointer-events: none;
+  box-sizing: border-box;
+}
+
+.shape-bounds-box .edit-resize-handle {
+  pointer-events: auto;
+  opacity: 1;
+}
+
+/* Hide bounds resize handles during text frame editing */
+.shape-bounds.frame-editing .shape-bounds-box .edit-resize-handle {
+  pointer-events: none;
+  opacity: 0;
+}
+
+.edit-mode.alt-active .shape-bounds .shape-anchor {
+  pointer-events: auto;
+}
+
 /* View dropdown */
 .edit-dropdown {
   position: relative;
@@ -464,14 +564,28 @@ img {
 }
 
 .pe-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
   padding: 0.75rem 1rem;
   font-size: 0.75rem;
   font-weight: 600;
   color: #888;
+  border-bottom: 1px solid #222;
+}
+
+.pe-type-select {
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  border-bottom: 1px solid #222;
+  font-weight: 600;
+}
+
+.pe-header-id {
+  font-size: 0.65rem;
+  color: #555;
+  letter-spacing: 0.03em;
   word-break: break-all;
+  text-transform: none;
 }
 
 .pe-section {
@@ -712,6 +826,56 @@ input[type="checkbox"] {
 
 .edit-context-parent:hover > .edit-context-submenu {
   display: block;
+}
+
+/* Inline delete confirmation */
+.edit-context-item.edit-context-confirm {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.9rem;
+}
+
+.edit-context-item.edit-context-confirm:hover {
+  background: transparent;
+}
+
+.edit-context-confirm-label {
+  flex: 1;
+  color: #e4a1a1;
+  font-size: 0.8rem;
+}
+
+.edit-context-confirm-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+
+.edit-context-confirm-btn.is-yes {
+  color: #8fd694;
+  background: rgba(143, 214, 148, 0.12);
+}
+
+.edit-context-confirm-btn.is-yes:hover {
+  background: rgba(143, 214, 148, 0.25);
+  color: #b5eab9;
+}
+
+.edit-context-confirm-btn.is-no {
+  color: #aaa;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.edit-context-confirm-btn.is-no:hover {
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
 }
 
 /* Draw-to-create mode */
