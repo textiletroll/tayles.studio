@@ -29,6 +29,19 @@ img {
   object-fit: cover;
 }
 
+/* ── Background layer ── */
+
+#pg-bg {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 200vh;
+  z-index: -1;
+  will-change: transform;
+  pointer-events: none;
+}
+
 /* ── Pegboard Grid ── */
 
 .pegboard {
@@ -58,9 +71,12 @@ img {
 .peg-element {
   position: relative;
   border-radius: 8px;
+  outline: none;
   background: #141414;
-  box-shadow: inset 0 0 0 1px #1e1e1e;
-  transition: box-shadow 0.25s ease;
+  transition: box-shadow 0.25s ease, outline-color 0.25s ease;
+  /* Establish a size-query container so children can scale with the
+     panel's own width (cqi) instead of the viewport (vw). */
+  container-type: inline-size;
 }
 
 .peg-element > .block-text,
@@ -130,48 +146,37 @@ img {
 }
 
 .peg-element:hover {
-  box-shadow: inset 0 0 0 1px #2a2a2a, 0 4px 24px rgba(0, 0, 0, 0.3);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
 }
 
 /* ── Text Block ── */
 
 .block-text {
-  padding: 1.5rem;
+  /* Padding scales with panel width so tiny panels don't get swallowed */
+  padding: clamp(0.35rem, 4cqi, 1.5rem);
   display: flex;
   flex-direction: column;
   justify-content: center;
   height: 100%;
+  /* Wrap aggressively: break at any character if a single word is too wide */
+  overflow-wrap: anywhere;
+  word-break: normal;
+  hyphens: auto;
 }
 
-.block-text h1 {
-  font-size: clamp(2rem, 5vw, 4rem);
-  font-weight: 700;
-  letter-spacing: -0.03em;
-  line-height: 1.1;
-}
-
-.block-text h2 {
-  font-size: clamp(1.5rem, 3vw, 2.5rem);
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  line-height: 1.2;
-}
-
-.block-text h3 {
-  font-size: clamp(1.1rem, 2vw, 1.5rem);
-  font-weight: 500;
-  line-height: 1.3;
-}
-
-.block-text p {
-  font-size: 1rem;
-  color: #999;
+/* Font sizes use cqi (container query inline-size) so text scales smoothly
+   with the panel's own width. Coefficients are tuned so the cqi term drives
+   sizing across typical panels — the clamp max only kicks in at very large
+   containers, the min only at very small ones. */
+.block-text .text-main {
+  /* fontSize is set inline via cqi; these are the shared typographic defaults */
+  line-height: 1.15;
   max-width: 50ch;
 }
 
 .block-text .subtext {
   margin-top: 0.75rem;
-  font-size: 0.875rem;
+  font-size: clamp(0.65rem, 3.2cqi, 0.875rem);
   color: #666;
 }
 
@@ -198,7 +203,7 @@ img {
 .text-frame-overlay {
   position: absolute;
   border: 2px dashed rgba(100, 255, 140, 0.6);
-  z-index: 7;
+  z-index: 13;
   cursor: move;
   box-sizing: border-box;
   pointer-events: auto;
@@ -211,7 +216,7 @@ img {
   background: rgba(100, 255, 140, 0.8);
   border: 2px solid #fff;
   border-radius: 2px;
-  z-index: 8;
+  z-index: 14;
 }
 
 .frame-resize-top-left { top: -5px; left: -5px; cursor: nwse-resize; }
@@ -249,9 +254,9 @@ img {
   bottom: 0;
   left: 0;
   right: 0;
-  padding: 0.75rem 1rem;
+  padding: clamp(0.35rem, 3cqi, 0.75rem) clamp(0.5rem, 4cqi, 1rem);
   background: linear-gradient(transparent, rgba(0, 0, 0, 0.7));
-  font-size: 0.8rem;
+  font-size: clamp(0.65rem, 4cqi, 0.8rem);
   color: #ccc;
 }
 
@@ -314,6 +319,7 @@ img {
   inset: 0;
   pointer-events: none;
   z-index: 0;
+  overflow: visible;
 }
 
 .edit-grid-line-v {
@@ -330,6 +336,16 @@ img {
   right: 0;
   height: 1px;
   background: rgba(255, 255, 255, 0.04);
+}
+
+.edit-row-label {
+  position: absolute;
+  left: -1.75rem;
+  font-size: 0.55rem;
+  color: rgba(255, 255, 255, 0.25);
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
 }
 
 /* Edit-mode element styles */
@@ -353,12 +369,12 @@ img {
 .edit-element.is-dragging {
   cursor: grabbing;
   opacity: 0.8;
-  z-index: 10;
+  z-index: 11 !important;
   outline-color: rgba(100, 140, 255, 0.7);
 }
 
 .edit-element.is-resizing {
-  z-index: 10;
+  z-index: 11 !important;
   outline-color: rgba(100, 140, 255, 0.7);
 }
 
@@ -446,23 +462,36 @@ img {
   cursor: nwse-resize;
 }
 
-/* Selected element */
+/* Selected element — !important overrides the inline outline set by applyDesign (panel border).
+   z-index lifts it above neighboring panels so the outline isn't hidden. */
 .edit-element.is-selected {
-  outline: 2px solid rgba(100, 140, 255, 0.7);
+  outline: 2px solid rgba(100, 140, 255, 0.7) !important;
+  outline-offset: 0px !important;
+  z-index: 11 !important;
+}
+
+/* Selected text panels: show grab cursor for frame dragging */
+.edit-element.is-selected[data-type="text"] {
+  cursor: grab;
 }
 
 /* Suppress outline on shaped elements — the bounds overlay replaces it */
 .edit-element.is-selected.has-shape-bounds {
+  outline: none !important;
+}
+
+/* Lines: wrapper spans the whole grid, so the default outline would be
+   huge and misleading. Rely on the anchor handles for selection feedback. */
+.edit-element.is-selected[data-type="line"] {
   outline: none;
 }
 
-/* Bounds overlay — transparent grid-sized container that inherits the wrapper's transform.
-   Hosts the anchor handles and the tight-bbox inner box. */
+/* Bounds overlay — transparent grid-sized container that hosts the
+   anchor handles and the tight-bbox inner box. */
 .shape-bounds {
   position: relative;
   pointer-events: none;
-  z-index: 4;
-  transform-origin: center center;
+  z-index: 12;
 }
 
 /* Inner box — tight dashed rectangle around the shape's actual bbox.
@@ -895,6 +924,91 @@ input[type="checkbox"] {
   z-index: 5;
 }
 
+/* ── Line elements ── */
+
+/* Wrapper spans the full grid; only the SVG stroke is hit-testable so
+   lines never block underlying panels. */
+.peg-element[data-type="line"] {
+  pointer-events: none;
+  background: transparent !important;
+  box-shadow: none !important;
+  border: none !important;
+}
+
+.line-svg {
+  display: block;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.line-path {
+  pointer-events: stroke;
+  cursor: move;
+}
+
+.edit-mode.alt-active .line-path {
+  cursor: crosshair;
+}
+
+.edit-mode .peg-element[data-type="line"].is-selected .line-path {
+  filter: drop-shadow(0 0 1.5px rgba(120, 160, 255, 0.85));
+}
+
+/* Line build-mode ghost preview */
+.edit-line-mode {
+  cursor: crosshair;
+}
+
+.line-ghost {
+  pointer-events: none;
+  z-index: 20;
+  overflow: visible;
+  width: 100%;
+  height: 100%;
+}
+
+/* Line anchor editing overlay — full grid, holds anchor handles.
+   Outer element has no visuals; handles are absolute-positioned. */
+.line-bounds {
+  position: relative;
+  pointer-events: none;
+  z-index: 6;
+}
+
+.line-anchor {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  margin: -6px 0 0 -6px;
+  background: #648cff;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  cursor: grab;
+  pointer-events: auto;
+  z-index: 7;
+  transition: transform 0.1s;
+}
+
+.line-anchor:hover {
+  transform: scale(1.35);
+  background: #8aabff;
+}
+
+.line-anchor.is-dragging {
+  cursor: grabbing;
+  transform: scale(1.5);
+  background: #a0bdff;
+}
+
+.pe-type-readonly {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+  font-size: 0.75rem;
+  color: #aaa;
+  padding: 4px 0;
+}
+
 /* Save flash notification */
 .edit-flash {
   position: fixed;
@@ -923,4 +1037,264 @@ input[type="checkbox"] {
 
 @keyframes edit-flash-out {
   to { opacity: 0; transform: translateX(-50%) translateY(8px); }
+}
+
+/* ── Animated backgrounds ── */
+
+@keyframes bg-flow {
+  0%   { background-position: 0% 50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+@keyframes bg-aurora {
+  0%   { background-position: 0% 0%; }
+  50%  { background-position: 100% 100%; }
+  100% { background-position: 0% 0%; }
+}
+
+/* ── Background settings modal ── */
+
+.bg-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.bg-modal {
+  background: #141414;
+  border: 1px solid #2a2a2a;
+  border-radius: 10px;
+  padding: 1.1rem 1.25rem;
+  min-width: 300px;
+  color: #e8e8e8;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
+}
+
+.bg-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.9rem;
+}
+
+.bg-modal-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.bg-modal-close {
+  background: none;
+  border: none;
+  color: #999;
+  cursor: pointer;
+  font-size: 1.1rem;
+  padding: 0 0.25rem;
+}
+
+.bg-modal-close:hover { color: #fff; }
+
+.bg-modal-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.55rem;
+  font-size: 0.75rem;
+  color: #bbb;
+}
+
+.bg-modal-field > label {
+  flex-shrink: 0;
+}
+
+.bg-modal-field select,
+.bg-modal-field input[type="number"] {
+  background: #1a1a1a;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  color: #e8e8e8;
+  font-size: 0.75rem;
+  padding: 0.25rem 0.4rem;
+  width: 110px;
+}
+
+.bg-modal-field input[type="color"] {
+  width: 40px;
+  height: 22px;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+  padding: 0;
+}
+
+.bg-modal-field.is-hidden { display: none; }
+
+.bg-modal-range {
+  flex: 1;
+  accent-color: #7c6fe0;
+  cursor: pointer;
+}
+
+.bg-modal-range-val {
+  font-size: 0.7rem;
+  color: #999;
+  min-width: 2rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Scroll animations ── */
+
+/* Hidden state before entrance — !important overrides inline opacity from applyDesign */
+.peg-element[data-anim-state="hidden"] {
+  opacity: 0 !important;
+  pointer-events: none;
+}
+
+/* Playing entrance or exit */
+.peg-element[data-anim-state="entering"],
+.peg-element[data-anim-state="exiting"] {
+  animation-fill-mode: both;
+}
+
+/* After entrance completes */
+.peg-element[data-anim-state="visible"] {
+  opacity: 1;
+}
+
+/* After exit completes */
+.peg-element[data-anim-state="exited"] {
+  opacity: 0 !important;
+  pointer-events: none;
+}
+
+/* ── Entrance keyframes ── */
+
+@keyframes anim-fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes anim-fadeInUp {
+  from { opacity: 0; transform: translateY(40px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes anim-fadeInDown {
+  from { opacity: 0; transform: translateY(-40px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes anim-fadeInLeft {
+  from { opacity: 0; transform: translateX(-40px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes anim-fadeInRight {
+  from { opacity: 0; transform: translateX(40px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes anim-zoomIn {
+  from { opacity: 0; transform: scale(0.6); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+@keyframes anim-slideInUp {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0); }
+}
+
+@keyframes anim-slideInLeft {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(0); }
+}
+
+@keyframes anim-slideInRight {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
+}
+
+@keyframes anim-flipInX {
+  from { opacity: 0; transform: perspective(400px) rotateX(90deg); }
+  to   { opacity: 1; transform: perspective(400px) rotateX(0deg); }
+}
+
+/* ── Exit keyframes ── */
+
+@keyframes anim-fadeOut {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+@keyframes anim-fadeOutDown {
+  from { opacity: 1; transform: translateY(0); }
+  to   { opacity: 0; transform: translateY(40px); }
+}
+
+@keyframes anim-fadeOutUp {
+  from { opacity: 1; transform: translateY(0); }
+  to   { opacity: 0; transform: translateY(-40px); }
+}
+
+@keyframes anim-zoomOut {
+  from { opacity: 1; transform: scale(1); }
+  to   { opacity: 0; transform: scale(0.6); }
+}
+
+/* ── Scroll effect keyframes ── */
+
+@keyframes anim-pulse {
+  0%   { transform: scale(1); }
+  50%  { transform: scale(1.06); }
+  100% { transform: scale(1); }
+}
+
+@keyframes anim-shake {
+  0%, 100% { transform: translateX(0); }
+  15%      { transform: translateX(-6px); }
+  30%      { transform: translateX(5px); }
+  45%      { transform: translateX(-4px); }
+  60%      { transform: translateX(3px); }
+  75%      { transform: translateX(-2px); }
+}
+
+@keyframes anim-bounce {
+  0%, 100% { transform: translateY(0); }
+  30%      { transform: translateY(-16px); }
+  50%      { transform: translateY(0); }
+  70%      { transform: translateY(-8px); }
+}
+
+@keyframes anim-wiggle {
+  0%, 100% { transform: rotate(0deg); }
+  20%      { transform: rotate(-3deg); }
+  40%      { transform: rotate(3deg); }
+  60%      { transform: rotate(-2deg); }
+  80%      { transform: rotate(1deg); }
+}
+
+@keyframes anim-float {
+  0%   { transform: translateY(0); }
+  50%  { transform: translateY(-12px); }
+  100% { transform: translateY(0); }
+}
+
+@keyframes anim-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+@keyframes anim-flash {
+  0%, 100% { opacity: 1; }
+  25%      { opacity: 0.2; }
+  50%      { opacity: 1; }
+  75%      { opacity: 0.2; }
 }

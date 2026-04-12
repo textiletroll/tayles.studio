@@ -17,19 +17,18 @@ export function createTextBlock(content) {
     if (f.rotation) el.style.transform = `rotate(${f.rotation}deg)`;
   }
 
-  if (content.tag === 'h1' || content.tag === 'h2' || content.tag === 'h3') {
-    const heading = document.createElement(content.tag);
-    heading.innerHTML = content.text;
-    el.appendChild(heading);
-  } else {
-    const p = document.createElement('p');
-    p.innerHTML = content.text;
-    el.appendChild(p);
-  }
+  // Main text — fontSize in cqi units, migrated from legacy tag sizes
+  const main = document.createElement('p');
+  main.classList.add('text-main');
+  const fontSize = content.fontSize ?? { h1: 13, h2: 9, h3: 6.5 }[content.tag] ?? 4;
+  main.style.fontSize = `clamp(0.5rem, ${fontSize}cqi, 6rem)`;
+  main.innerHTML = content.text;
+  el.appendChild(main);
 
   if (content.subtext) {
     const sub = document.createElement('p');
     sub.classList.add('subtext');
+    if (content.subtextColor) sub.style.color = content.subtextColor;
     sub.innerHTML = content.subtext;
     el.appendChild(sub);
   }

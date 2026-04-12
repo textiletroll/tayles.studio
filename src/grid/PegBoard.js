@@ -1,23 +1,14 @@
 import { createTextBlock } from '../elements/TextBlock.js';
 import { createImageBlock } from '../elements/ImageBlock.js';
 import { createSplitBlock } from '../elements/SplitBlock.js';
+import { createLineBlock } from '../elements/LineBlock.js';
 
 const elementFactories = {
   text: createTextBlock,
   image: createImageBlock,
   split: createSplitBlock,
+  line: createLineBlock,
 };
-
-/** Compose a CSS transform string from a style object's rotation/flipX/flipY. */
-export function composeTransform(style) {
-  const rot = style?.rotation || 0;
-  const sx = style?.flipX ? -1 : 1;
-  const sy = style?.flipY ? -1 : 1;
-  const parts = [];
-  if (sx !== 1 || sy !== 1) parts.push(`scale(${sx}, ${sy})`);
-  if (rot !== 0) parts.push(`rotate(${rot}deg)`);
-  return parts.join(' ');
-}
 
 /**
  * Compute the axis-aligned bounding box of a shape in grid-local units.
@@ -48,6 +39,8 @@ export class PegBoard {
     this.rowHeight = options.rowHeight || 100;
     this.gap = options.gap || 16;
     this.elements = new Map();
+    this.background = null;
+    this.onParallaxUpdate = null; // optional callback after parallax transforms change
     this._shapeSizes = new Map(); // track last rendered size per element
     this._shapeRO = new ResizeObserver((entries) => {
       for (const entry of entries) {
@@ -66,6 +59,11 @@ export class PegBoard {
     // Keep row height in sync with column width for square cells
     this._gridRO = new ResizeObserver(() => this._syncRowHeight());
 
+    // Scroll animation tracking
+    this._animObserver = null;
+    this._animObservedIds = new Set();
+    this.editModeActive = false;
+
     this.setup();
   }
 
@@ -75,6 +73,15 @@ export class PegBoard {
     this.container.style.setProperty('--pg-gap', `${this.gap}px`);
     this._gridRO.observe(this.container);
     this._syncRowHeight();
+
+    // Background layer (fixed div behind content)
+    if (!this._bgEl) {
+      this._bgEl = document.createElement('div');
+      this._bgEl.id = 'pg-bg';
+      document.body.prepend(this._bgEl);
+      this._onScroll = () => this._applyParallaxScroll();
+      window.addEventListener('scroll', this._onScroll, { passive: true });
+    }
   }
 
   _syncRowHeight() {
@@ -85,6 +92,32 @@ export class PegBoard {
     this.container.style.setProperty('--pg-row-height', `${this.rowHeight}px`);
   }
 
+  /** Column width in pixels (matches CSS grid layout — gap-aware). */
+  _cellWidth() {
+    const w = this.container.clientWidth;
+    if (w === 0) return 0;
+    return (w - (this.columns - 1) * this.gap) / this.columns;
+  }
+
+  /** Convert grid-cell coords to pixels relative to the grid container's
+      content box. Integer values map exactly to grid lines / panel edges. */
+  gridToPixel(x, y) {
+    const cellW = this._cellWidth();
+    return {
+      x: x * (cellW + this.gap),
+      y: y * (this.rowHeight + this.gap),
+    };
+  }
+
+  /** Inverse of gridToPixel. */
+  pixelToGrid(px, py) {
+    const cellW = this._cellWidth();
+    return {
+      x: cellW + this.gap === 0 ? 0 : px / (cellW + this.gap),
+      y: this.rowHeight + this.gap === 0 ? 0 : py / (this.rowHeight + this.gap),
+    };
+  }
+
   addElement(config) {
     const wrapper = document.createElement('div');
     wrapper.classList.add('peg-element');
@@ -93,7 +126,10 @@ export class PegBoard {
 
     wrapper.style.gridColumn = `${config.gridColumn} / span ${config.colSpan || 1}`;
     wrapper.style.gridRow = `${config.gridRow} / span ${config.rowSpan || 1}`;
-    if (config.zIndex != null) wrapper.style.zIndex = config.zIndex;
+
+    // Layer system: 1 (front) to 10 (back). Maps to z-index 10→1.
+    if (!config.layer) config.layer = 1;
+    this._applyLayerStyle(wrapper, config);
 
     const factory = elementFactories[config.type];
     if (!factory) {
@@ -103,6 +139,14 @@ export class PegBoard {
 
     const element = factory(config.content);
     wrapper.appendChild(element);
+
+    // If this element has an entrance animation, hide it immediately so it
+    // never flashes on screen before the scroll trigger fires.
+    const a = config.animation;
+    if (!this.editModeActive && a && a.enabled && a.entrance && a.entrance !== 'none') {
+      wrapper.dataset.animState = 'hidden';
+    }
+
     this.container.appendChild(wrapper);
     this.elements.set(config.id, { config, wrapper, element });
 
@@ -146,14 +190,24 @@ export class PegBoard {
     const { config, wrapper } = entry;
     const s = config.style || {};
 
-    // Border (inset box-shadow so inner radius matches outer)
+    // Lines are transparent overlays — skip all panel-style decoration
+    if (config.type === 'line') {
+      this._applyLine(wrapper, config);
+      this._shapeRO.observe(wrapper);
+      return;
+    }
+
+    // Border — outline straddles the grid edge (half outside, half inside) so
+    // line elements at the same coord overlap it. No corner gaps like box-shadow.
+    wrapper.style.boxShadow = '';
     wrapper.style.border = 'none';
     if (s.borderShow === false) {
-      wrapper.style.boxShadow = 'none';
+      wrapper.style.outline = 'none';
     } else {
       const bw = s.borderWidth ?? 1;
       const bc = s.borderColor || '#1e1e1e';
-      wrapper.style.boxShadow = `inset 0 0 0 ${bw}px ${bc}`;
+      wrapper.style.outline = `${bw}px solid ${bc}`;
+      wrapper.style.outlineOffset = `${-bw / 2}px`;
     }
 
     // Border radius
@@ -161,9 +215,6 @@ export class PegBoard {
 
     // Opacity
     wrapper.style.opacity = s.opacity ?? 1;
-
-    // Transform — rotation in 90° steps + flips
-    wrapper.style.transform = composeTransform(s);
 
     // Background color — split panels use per-side colors instead
     if (config.type === 'split') {
@@ -181,8 +232,8 @@ export class PegBoard {
       wrapper.style.color = '';
     }
 
-    // Clip frame — hide text that overflows the panel
-    if (config.content?.clipFrame) {
+    // Text panels always clip overflow — the panel acts as a viewport for the text frame
+    if (config.type === 'text') {
       wrapper.style.overflow = 'hidden';
     } else {
       wrapper.style.overflow = '';
@@ -206,12 +257,14 @@ export class PegBoard {
       }
     }
 
-    // Custom shape
+    // Custom shape — shapes use SVG borders, so hide the outline border
     const shape = s.shape;
     if (shape && shape.preset === 'circle') {
+      wrapper.style.outline = 'none';
       this._applyCircleShape(wrapper, config);
       this._shapeRO.observe(wrapper);
     } else if (shape && shape.anchors && shape.anchors.length >= 3) {
+      wrapper.style.outline = 'none';
       this._applyShape(wrapper, config);
       this._shapeRO.observe(wrapper);
     } else {
@@ -243,7 +296,20 @@ export class PegBoard {
 
     // Build the path — rounded corners when smooth is on
     const radius = shape.smooth ? (s.borderRadius ?? 8) : 0;
-    const pathD = this._roundedPolygonPath(pts, radius);
+
+    // Straddle the anchor edge: clip to an outset polygon (bw/2 outward) so
+    // the border's outer half extends past the anchor line. The inner ring
+    // edge is inset bw/2 inward. Total ring thickness = bw, centered on the
+    // original anchor polygon — matching how rectangle borders now straddle
+    // their grid-cell edge and aligning with lines at the same coord.
+    const bw = s.borderShow !== false ? (s.borderWidth ?? 1) : 0;
+    const half = bw / 2;
+    const outerPts = half > 0 ? this._insetPolygon(pts, -half) : pts;
+    const outerPathD = this._roundedPolygonPath(
+      outerPts.length >= 3 ? outerPts : pts,
+      radius,
+    );
+    const clipPathD = outerPathD;
 
     // Clip shape (userSpaceOnUse with pixel coords)
     const clipId = `shape-${config.id}`;
@@ -257,7 +323,7 @@ export class PegBoard {
     clipPath.setAttribute('id', clipId);
 
     const clipPathEl = document.createElementNS(ns, 'path');
-    clipPathEl.setAttribute('d', pathD);
+    clipPathEl.setAttribute('d', clipPathD);
     clipPath.appendChild(clipPathEl);
 
     defs.appendChild(clipPath);
@@ -268,15 +334,13 @@ export class PegBoard {
     wrapper.style.clipPath = `url(#${clipId})`;
     wrapper.style.borderRadius = '0';
 
-    // Border overlay — filled ring between outer shape and inset shape
+    // Border overlay — filled ring between outset outer and inset inner
     if (s.borderShow !== false) {
-      const bw = s.borderWidth ?? 1;
       const bc = s.borderColor || '#1e1e1e';
 
-      const insetPts = this._insetPolygon(pts, bw);
-      const insetRadius = radius;  // inner corners match outer rounding
-      const innerPathD = insetPts.length >= 3
-        ? this._roundedPolygonPath(insetPts, insetRadius)
+      const innerInsetPts = this._insetPolygon(pts, half);
+      const innerPathD = innerInsetPts.length >= 3
+        ? this._roundedPolygonPath(innerInsetPts, radius)
         : '';
 
       const borderSvg = document.createElementNS(ns, 'svg');
@@ -285,7 +349,7 @@ export class PegBoard {
 
       const borderPath = document.createElementNS(ns, 'path');
       // Outer CW + inner CCW via reversed inner path → evenodd fills the ring
-      borderPath.setAttribute('d', pathD + ' ' + this._reversePath(innerPathD));
+      borderPath.setAttribute('d', outerPathD + ' ' + this._reversePath(innerPathD));
       borderPath.setAttribute('fill', bc);
       borderPath.setAttribute('fill-rule', 'evenodd');
       borderSvg.appendChild(borderPath);
@@ -294,6 +358,61 @@ export class PegBoard {
 
     // Clear box-shadow since SVG border replaces it
     wrapper.style.boxShadow = 'none';
+
+    // Shape-aware content padding: push inline children (text/image/split)
+    // inward to the shape's inscribed cross-rectangle at center so content
+    // doesn't get chopped by asymmetric dips in the shape outline.
+    this._applyShapePadding(wrapper, pts, w, h);
+  }
+
+  /**
+   * Compute the shape's inscribed rectangle at center (vertical slice at
+   * center-x, horizontal slice at center-y) and apply it as padding to the
+   * content child so inline text sits within the visible shape region.
+   */
+  _applyShapePadding(wrapper, pts, w, h) {
+    const cx = w / 2;
+    const cy = h / 2;
+    let topY = 0;
+    let botY = h;
+    let leftX = 0;
+    let rightX = w;
+
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i];
+      const b = pts[(i + 1) % pts.length];
+
+      // Edge crosses vertical line x = cx?
+      if (a.x !== b.x && (a.x - cx) * (b.x - cx) <= 0) {
+        const t = (cx - a.x) / (b.x - a.x);
+        const y = a.y + t * (b.y - a.y);
+        if (y < cy) topY = Math.max(topY, y);
+        else botY = Math.min(botY, y);
+      }
+
+      // Edge crosses horizontal line y = cy?
+      if (a.y !== b.y && (a.y - cy) * (b.y - cy) <= 0) {
+        const t = (cy - a.y) / (b.y - a.y);
+        const x = a.x + t * (b.x - a.x);
+        if (x < cx) leftX = Math.max(leftX, x);
+        else rightX = Math.min(rightX, x);
+      }
+    }
+
+    const padTop = Math.max(0, topY);
+    const padBot = Math.max(0, h - botY);
+    const padLeft = Math.max(0, leftX);
+    const padRight = Math.max(0, w - rightX);
+
+    const child = wrapper.querySelector('.block-text, .block-image, .block-split');
+    if (!child) return;
+    // Combine with the child's base padding via CSS max() so the shape
+    // padding never makes the inside smaller than the normal aesthetic.
+    const base = 'clamp(0.35rem, 4cqi, 1.5rem)';
+    child.style.paddingTop = `max(${base}, ${padTop}px)`;
+    child.style.paddingBottom = `max(${base}, ${padBot}px)`;
+    child.style.paddingLeft = `max(${base}, ${padLeft}px)`;
+    child.style.paddingRight = `max(${base}, ${padRight}px)`;
   }
 
   _applyCircleShape(wrapper, config) {
@@ -304,13 +423,17 @@ export class PegBoard {
     const h = wrapper.offsetHeight;
     if (w === 0 || h === 0) return;
 
-    // Perfect ellipse clip
-    wrapper.style.clipPath = 'ellipse(50% 50% at 50% 50%)';
+    // Straddle the wrapper edge: expand the clip ellipse outward by bw/2 so
+    // the outer half of the border stroke isn't clipped.
+    const bwc = s.borderShow !== false ? (s.borderWidth ?? 1) : 0;
+    const halfc = bwc / 2;
+    wrapper.style.clipPath = halfc > 0
+      ? `ellipse(${w / 2 + halfc}px ${h / 2 + halfc}px at 50% 50%)`
+      : 'ellipse(50% 50% at 50% 50%)';
     wrapper.style.borderRadius = '0';
 
-    // Border overlay — ellipse ring
+    // Border overlay — ellipse ring centered on the wrapper edge
     if (s.borderShow !== false) {
-      const bw = s.borderWidth ?? 1;
       const bc = s.borderColor || '#1e1e1e';
       const ns = 'http://www.w3.org/2000/svg';
 
@@ -321,11 +444,11 @@ export class PegBoard {
       const ellipse = document.createElementNS(ns, 'ellipse');
       ellipse.setAttribute('cx', w / 2);
       ellipse.setAttribute('cy', h / 2);
-      ellipse.setAttribute('rx', w / 2 - bw / 2);
-      ellipse.setAttribute('ry', h / 2 - bw / 2);
+      ellipse.setAttribute('rx', w / 2);
+      ellipse.setAttribute('ry', h / 2);
       ellipse.setAttribute('fill', 'none');
       ellipse.setAttribute('stroke', bc);
-      ellipse.setAttribute('stroke-width', bw);
+      ellipse.setAttribute('stroke-width', bwc);
       borderSvg.appendChild(ellipse);
       wrapper.appendChild(borderSvg);
     }
@@ -336,6 +459,79 @@ export class PegBoard {
   _clearShape(wrapper) {
     wrapper.querySelectorAll('.shape-clip-defs, .shape-border-overlay').forEach(el => el.remove());
     wrapper.style.clipPath = '';
+    const child = wrapper.querySelector('.block-text, .block-image, .block-split');
+    if (child) {
+      child.style.paddingTop = '';
+      child.style.paddingBottom = '';
+      child.style.paddingLeft = '';
+      child.style.paddingRight = '';
+    }
+  }
+
+  /**
+   * Render a line element's SVG path from its anchor list.
+   * Anchors are in absolute grid-cell units (0..colSpan, 0..rowSpan).
+   */
+  _applyLine(wrapper, config) {
+    const svg = wrapper.querySelector('.line-svg');
+    if (!svg) return;
+
+    const s = config.style || {};
+    const content = config.content || {};
+    const anchors = content.anchors || [];
+
+    const w = wrapper.offsetWidth;
+    const h = wrapper.offsetHeight;
+
+    // Strip old children
+    while (svg.firstChild) svg.firstChild.remove();
+
+    // Wrapper decorations off
+    wrapper.style.boxShadow = 'none';
+    wrapper.style.background = '';
+    wrapper.style.border = 'none';
+    wrapper.style.clipPath = '';
+    wrapper.style.borderRadius = '0';
+    wrapper.style.opacity = s.opacity ?? 1;
+
+    if (w === 0 || h === 0 || anchors.length < 2) return;
+
+    svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+
+    // Gap-aware mapping: integer grid-line coords land exactly on panel edges.
+    const pts = anchors.map(a => this.gridToPixel(a.x, a.y));
+
+    const d = s.smooth ? this._smoothPolyline(pts) : this._sharpPolyline(pts);
+
+    const ns = 'http://www.w3.org/2000/svg';
+    const path = document.createElementNS(ns, 'path');
+    path.classList.add('line-path');
+    path.setAttribute('d', d);
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke', s.borderColor || '#e8e8e8');
+    path.setAttribute('stroke-width', s.borderWidth ?? 2);
+    path.setAttribute('stroke-linecap', 'round');
+    path.setAttribute('stroke-linejoin', 'round');
+    svg.appendChild(path);
+  }
+
+  _sharpPolyline(pts) {
+    return pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x},${p.y}`).join(' ');
+  }
+
+  /** Chaikin-style smoothing: use original points as quadratic control points,
+      endpoints as midpoints between successive anchors. */
+  _smoothPolyline(pts) {
+    if (pts.length < 3) return this._sharpPolyline(pts);
+    let d = `M${pts[0].x},${pts[0].y}`;
+    for (let i = 1; i < pts.length - 1; i++) {
+      const mx = (pts[i].x + pts[i + 1].x) / 2;
+      const my = (pts[i].y + pts[i + 1].y) / 2;
+      d += ` Q${pts[i].x},${pts[i].y} ${mx},${my}`;
+    }
+    const last = pts[pts.length - 1];
+    d += ` L${last.x},${last.y}`;
+    return d;
   }
 
   /**
@@ -501,16 +697,26 @@ export class PegBoard {
     if (layout.grid) {
       this.columns = layout.grid.columns || this.columns;
       this.rowHeight = layout.grid.rowHeight || this.rowHeight;
-      this.gap = layout.grid.gap || this.gap;
+      this.gap = layout.grid.gap ?? this.gap;
       this.setup();
     }
-    layout.elements.forEach((el) => this.addElement(el));
+    this.background = layout.background || null;
+    this.applyBackground();
+    layout.elements.forEach((el) => {
+      // Migrate legacy zIndex → layer
+      if (el.zIndex != null && !el.layer) {
+        el.layer = Math.max(1, Math.min(10, el.zIndex <= 0 ? 10 : 11 - el.zIndex));
+        delete el.zIndex;
+      }
+      this.addElement(el);
+    });
+    this.setupScrollAnimations();
   }
 
   getLayoutData() {
     const elements = [];
     this.elements.forEach(({ config }) => elements.push(config));
-    return {
+    const data = {
       grid: {
         columns: this.columns,
         rowHeight: this.rowHeight,
@@ -518,5 +724,241 @@ export class PegBoard {
       },
       elements,
     };
+    if (this.background) data.background = this.background;
+    return data;
+  }
+
+  /**
+   * Apply the background config to the #pg-bg layer.
+   * Supports: solid, gradient (linear), animated (flow / aurora presets).
+   */
+  applyBackground() {
+    const el = this._bgEl;
+    if (!el) return;
+
+    el.style.animation = '';
+    el.style.backgroundSize = '';
+    el.style.backgroundImage = '';
+    el.style.backgroundColor = '';
+
+    const bg = this.background;
+    if (!bg) { this._applyParallaxScroll(); return; }
+
+    const color1 = bg.color1 || '#0a0a0a';
+    const color2 = bg.color2 || '#1a1a3a';
+    const angle = bg.angle ?? 135;
+
+    if (bg.type === 'solid') {
+      el.style.backgroundColor = color1;
+    } else if (bg.type === 'gradient') {
+      el.style.backgroundImage = `linear-gradient(${angle}deg, ${color1}, ${color2})`;
+    } else if (bg.type === 'animated') {
+      const preset = bg.preset || 'flow';
+      el.style.backgroundImage = `linear-gradient(${angle}deg, ${color1}, ${color2}, ${color1})`;
+      el.style.backgroundSize = '400% 400%';
+      el.style.animation = preset === 'aurora'
+        ? 'bg-aurora 25s linear infinite'
+        : 'bg-flow 20s ease-in-out infinite';
+    }
+
+    this._applyParallaxScroll();
+  }
+
+  // ── Scroll animations ──
+
+  /** Set up scroll-triggered animations. Uses grid rows as trigger points. */
+  setupScrollAnimations() {
+    // Remove previous scroll listener
+    if (this._animScrollHandler) {
+      window.removeEventListener('scroll', this._animScrollHandler);
+      this._animScrollHandler = null;
+    }
+
+    if (this.editModeActive) {
+      // In edit mode, make everything visible and un-animated
+      this.elements.forEach(({ wrapper }) => {
+        delete wrapper.dataset.animState;
+        delete wrapper.dataset.scrollPlayed;
+        wrapper.style.animation = '';
+      });
+      return;
+    }
+
+    // Collect animated elements and set initial state
+    const animated = [];
+    this.elements.forEach(({ config, wrapper }) => {
+      const a = config.animation;
+      if (!a || !a.enabled) return;
+      // Default trigger row = the element's own row (animates when it scrolls into view)
+      if (a.triggerRow == null) a.triggerRow = config.gridRow;
+      if (a.entrance && a.entrance !== 'none') {
+        wrapper.dataset.animState = 'hidden';
+        wrapper.style.animation = '';
+      }
+      // Reset scroll effect state
+      delete wrapper.dataset.scrollPlayed;
+      animated.push({ config, wrapper });
+    });
+
+    if (animated.length === 0) return;
+
+    const checkScroll = () => {
+      // The pixel offset of the viewport's bottom edge relative to the grid container top
+      const containerTop = this.container.getBoundingClientRect().top + window.scrollY;
+      const viewportBottom = window.scrollY + window.innerHeight;
+      const scrollIntoGrid = viewportBottom - containerTop;
+      // Convert to grid row number (1-based)
+      const rowH = this.rowHeight + this.gap;
+      const revealedRow = rowH > 0 ? Math.floor(scrollIntoGrid / rowH) + 1 : 999;
+
+      for (const entry of animated) {
+        const a = entry.config.animation;
+        const triggerRow = a.triggerRow ?? entry.config.gridRow;
+        const scrollRow = a.scrollTriggerRow ?? triggerRow;
+        const state = entry.wrapper.dataset.animState;
+
+        // Exit row only applies when explicitly set and above entrance row
+        const exitRow = (a.exitTriggerRow != null && a.exitTriggerRow > triggerRow)
+          ? a.exitTriggerRow : null;
+
+        // Visible zone: from entrance row up to (but not including) exit row.
+        // When no exit row is set, visible zone is unbounded above.
+        const inVisibleZone = revealedRow >= triggerRow
+          && (exitRow == null || revealedRow < exitRow);
+
+        if (inVisibleZone) {
+          if (state === 'hidden' || state === 'exited') {
+            this._playEntrance(entry);
+          }
+        } else {
+          if (state === 'visible' || state === 'entering') {
+            this._playExit(entry);
+          }
+        }
+
+        // Scroll effect — plays once when scrollTriggerRow is reached, resets when above
+        if (a.scroll && a.scroll !== 'none') {
+          if (revealedRow >= scrollRow) {
+            if (!entry.wrapper.dataset.scrollPlayed) {
+              this._playScrollEffect(entry);
+            }
+          } else {
+            // Reset so it replays on next scroll-down
+            delete entry.wrapper.dataset.scrollPlayed;
+          }
+        }
+      }
+    };
+
+    this._animScrollHandler = checkScroll;
+    window.addEventListener('scroll', this._animScrollHandler, { passive: true });
+    // Run once immediately to handle elements already in view
+    checkScroll();
+  }
+
+  _playEntrance(entry) {
+    const { config, wrapper } = entry;
+    const anim = config.animation;
+    if (!anim || !anim.entrance || anim.entrance === 'none') {
+      wrapper.dataset.animState = 'visible';
+      return;
+    }
+    const state = wrapper.dataset.animState;
+    if (state === 'visible' || state === 'entering') return;
+
+    const dur = anim.entranceDuration ?? anim.duration ?? 0.6;
+    wrapper.dataset.animState = 'entering';
+    wrapper.style.animation = `anim-${anim.entrance} ${dur}s ease both`;
+    wrapper.addEventListener('animationend', () => {
+      wrapper.dataset.animState = 'visible';
+      wrapper.style.animation = '';
+    }, { once: true });
+  }
+
+  _playExit(entry) {
+    const { config, wrapper } = entry;
+    const anim = config.animation;
+    if (!anim || !anim.exit || anim.exit === 'none') {
+      // No exit animation — panel stays visible
+      return;
+    }
+    const state = wrapper.dataset.animState;
+    if (state === 'hidden' || state === 'exited' || state === 'exiting') return;
+
+    const dur = anim.exitDuration ?? anim.duration ?? 0.6;
+    wrapper.dataset.animState = 'exiting';
+    wrapper.style.animation = `anim-${anim.exit} ${dur}s ease both`;
+    wrapper.addEventListener('animationend', () => {
+      wrapper.dataset.animState = 'exited';
+      wrapper.style.animation = '';
+    }, { once: true });
+  }
+
+  _playScrollEffect(entry) {
+    const { config, wrapper } = entry;
+    const anim = config.animation;
+    if (!anim || !anim.scroll || anim.scroll === 'none') return;
+    wrapper.dataset.scrollPlayed = '1';
+    const dur = anim.scrollDuration ?? anim.duration ?? 0.6;
+    wrapper.style.animation = '';
+    void wrapper.offsetWidth; // force reflow to restart if same animation
+    wrapper.style.animation = `anim-${anim.scroll} ${dur}s ease both`;
+    wrapper.addEventListener('animationend', () => {
+      wrapper.style.animation = '';
+    }, { once: true });
+  }
+
+  /** Apply z-index and data-layer attribute for a wrapper based on its config.layer. */
+  _applyLayerStyle(wrapper, config) {
+    const layer = config.layer || 1;
+    wrapper.style.zIndex = 11 - layer; // layer 1 → z-index 10, layer 10 → z-index 1
+    wrapper.dataset.layer = layer;
+  }
+
+  /** Update a single element's layer and re-apply parallax. */
+  setLayer(id, layer) {
+    const entry = this.elements.get(id);
+    if (!entry) return;
+    entry.config.layer = Math.max(1, Math.min(10, layer));
+    this._applyLayerStyle(entry.wrapper, entry.config);
+    this._applyParallaxScroll();
+  }
+
+  /** Shift bg layer and all panel layers based on scroll + parallax depth. */
+  _applyParallaxScroll() {
+    // Disable parallax in edit mode so panels stay aligned with the grid
+    if (this.editModeActive) {
+      if (this._bgEl) this._bgEl.style.transform = '';
+      this.elements.forEach(({ wrapper }) => { wrapper.style.translate = ''; });
+      if (this.onParallaxUpdate) this.onParallaxUpdate();
+      return;
+    }
+
+    const bgDepth = (this.background && this.background.parallax) || 0;
+
+    // Background layer
+    if (this._bgEl) {
+      if (bgDepth === 0) {
+        this._bgEl.style.transform = '';
+      } else {
+        const y = window.scrollY * bgDepth * -0.5;
+        this._bgEl.style.transform = `translateY(${y}px)`;
+      }
+    }
+
+    // Panel layers: layer 1 = no shift, layer 10 = max shift (approaching bg parallax)
+    // Uses `translate` property (not `transform`) to avoid conflicts with animations.
+    if (bgDepth === 0) {
+      this.elements.forEach(({ wrapper }) => { wrapper.style.translate = ''; });
+    } else {
+      this.elements.forEach(({ config, wrapper }) => {
+        const layer = config.layer || 1;
+        // fraction: layer 1 → 0, layer 10 → 0.9 (never quite as much as bg)
+        const fraction = (layer - 1) / 10;
+        const y = window.scrollY * bgDepth * fraction * -0.5;
+        wrapper.style.translate = y === 0 ? '' : `0 ${y}px`;
+      });
+    }
+    if (this.onParallaxUpdate) this.onParallaxUpdate();
   }
 }

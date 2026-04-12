@@ -6,7 +6,7 @@
 
 import { ShapeEditor } from './ShapeEditor.js';
 import { applySplitBoundary } from '../elements/SplitBlock.js';
-import { composeTransform, computeShapeBBox } from '../grid/PegBoard.js';
+import { computeShapeBBox } from '../grid/PegBoard.js';
 
 let _idCounter = 0;
 function uniqueId(prefix) {
@@ -48,6 +48,9 @@ export class EditMode {
 
   enable() {
     this.active = true;
+    this.board.editModeActive = true;
+    this.board._applyParallaxScroll();  // clear parallax translations for grid alignment
+    this.board.setupScrollAnimations(); // disables animations, makes all visible
     this.board.container.classList.add('edit-mode');
     this.toggleBtn.textContent = 'Exit Edit';
     this._attachElementHandlers();
@@ -67,18 +70,25 @@ export class EditMode {
     document.addEventListener('keydown', this._onAltDown);
     document.addEventListener('keyup', this._onAltUp);
     window.addEventListener('blur', this._onAltBlur);
+
+    // Keep overlays in sync with parallax (scroll + layer changes)
+    this.board.onParallaxUpdate = () => this._syncBoundsOverlay();
   }
 
   disable() {
     this.active = false;
+    this.board.editModeActive = false;
+    this.board._applyParallaxScroll();  // restore parallax translations
     this.board.container.classList.remove('edit-mode', 'alt-active');
     this.toggleBtn.textContent = 'Edit';
     this._detachElementHandlers();
     this._removeGridOverlay();
     this._dismissMenu();
     this._cancelDraw();
+    this._cancelLineMode();
     this._shapeEditor.deactivate();
     this._removeBoundsOverlay();
+    this._removeLineAnchors();
     this._selectElement(null);
     this.board.container.removeEventListener('contextmenu', this._onContextMenu);
     document.removeEventListener('pointerdown', this._onDismissMenu);
@@ -86,7 +96,9 @@ export class EditMode {
     document.removeEventListener('keydown', this._onAltDown);
     document.removeEventListener('keyup', this._onAltUp);
     window.removeEventListener('blur', this._onAltBlur);
+    this.board.onParallaxUpdate = null;
     this._saveLayout();
+    this.board.setupScrollAnimations(); // re-enable animations
   }
 
   // ── UI chrome ──
@@ -160,6 +172,7 @@ export class EditMode {
       }
     }
     this._removeBoundsOverlay();
+    this._removeLineAnchors();
     if (this._frameEditId && this._frameEditId !== id) {
       this._exitFrameEdit();
     }
@@ -170,8 +183,10 @@ export class EditMode {
       const entry = this.board.elements.get(id);
       if (entry) {
         entry.wrapper.classList.add('is-selected');
-        // For shaped elements, create a bounds overlay outside the clip-path
-        if (entry.config.style?.shape) {
+        if (entry.config.type === 'line') {
+          this._renderLineAnchors(id);
+        } else if (entry.config.style?.shape) {
+          // For shaped elements, create a bounds overlay outside the clip-path
           this._createBoundsOverlay(id);
         }
       }
@@ -197,6 +212,7 @@ export class EditMode {
     overlay.classList.add('shape-bounds');
     overlay.style.gridColumn = `${config.gridColumn} / span ${config.colSpan || 1}`;
     overlay.style.gridRow = `${config.gridRow} / span ${config.rowSpan || 1}`;
+    overlay.style.translate = wrapper.style.translate;
 
     // Inner: the visible dashed box that tightly wraps the shape's bbox.
     // Hosts the resize handles so they sit on the actual visible shape.
@@ -257,12 +273,15 @@ export class EditMode {
     if (!config) return;
     const gc = `${config.gridColumn} / span ${config.colSpan || 1}`;
     const gr = `${config.gridRow} / span ${config.rowSpan || 1}`;
-    const transform = composeTransform(config.style);
+
+    // Match the wrapper's parallax translate on overlays
+    const entry = this.board.elements.get(this._selectedId);
+    const wrapperTranslate = entry ? entry.wrapper.style.translate : '';
 
     if (this._boundsOverlay) {
       this._boundsOverlay.style.gridColumn = gc;
       this._boundsOverlay.style.gridRow = gr;
-      this._boundsOverlay.style.transform = transform;
+      this._boundsOverlay.style.translate = wrapperTranslate;
 
       // Tight bbox for the inner dashed box + resize handles
       if (this._boundsBox) {
@@ -278,12 +297,25 @@ export class EditMode {
     if (this._frameOverlay) {
       this._frameOverlay.style.gridColumn = gc;
       this._frameOverlay.style.gridRow = gr;
-      this._frameOverlay.style.transform = transform;
+      this._frameOverlay.style.translate = wrapperTranslate;
+    }
+    if (this._lineBounds) {
+      this._lineBounds.style.gridColumn = gc;
+      this._lineBounds.style.gridRow = gr;
+      this._lineBounds.style.translate = wrapperTranslate;
     }
   }
 
   _populatePanelEditor() {
     if (!this._panelEditorEl) return;
+
+    // Snapshot current section open/closed states before clearing
+    if (!this._sectionStates) this._sectionStates = new Map();
+    this._panelEditorEl.querySelectorAll('.pe-section-title').forEach(heading => {
+      const title = heading.textContent.trim();
+      const body = heading.nextElementSibling;
+      if (body) this._sectionStates.set(title, !body.classList.contains('pe-collapsed'));
+    });
 
     const body = this._panelEditorEl;
     body.innerHTML = '';
@@ -305,40 +337,54 @@ export class EditMode {
     const header = document.createElement('div');
     header.classList.add('pe-header');
 
-    const typeSelect = document.createElement('select');
-    typeSelect.classList.add('pe-input', 'pe-type-select');
-    [['text', 'Text'], ['image', 'Image'], ['split', 'Split']].forEach(([val, label]) => {
-      const opt = document.createElement('option');
-      opt.value = val;
-      opt.textContent = label;
-      if (val === config.type) opt.selected = true;
-      typeSelect.appendChild(opt);
-    });
-    typeSelect.addEventListener('change', () => {
-      this._changePanelType(config.id, typeSelect.value);
-    });
+    if (config.type === 'line') {
+      const typeLabel = document.createElement('div');
+      typeLabel.classList.add('pe-type-readonly');
+      typeLabel.textContent = 'Line';
+      header.appendChild(typeLabel);
+    } else {
+      const typeSelect = document.createElement('select');
+      typeSelect.classList.add('pe-input', 'pe-type-select');
+      [['text', 'Text'], ['image', 'Image'], ['split', 'Split']].forEach(([val, label]) => {
+        const opt = document.createElement('option');
+        opt.value = val;
+        opt.textContent = label;
+        if (val === config.type) opt.selected = true;
+        typeSelect.appendChild(opt);
+      });
+      typeSelect.addEventListener('change', () => {
+        this._changePanelType(config.id, typeSelect.value);
+      });
+      header.appendChild(typeSelect);
+    }
 
     const idLabel = document.createElement('div');
     idLabel.classList.add('pe-header-id');
     idLabel.textContent = config.id;
-
-    header.append(typeSelect, idLabel);
+    header.appendChild(idLabel);
     body.appendChild(header);
 
-    // Type-specific controls first (the important stuff)
-    if (config.type === 'text') {
-      body.appendChild(this._buildTextEditor(config));
-    } else if (config.type === 'image') {
-      body.appendChild(this._buildImageEditor(config));
-    } else if (config.type === 'split') {
-      body.appendChild(this._buildSplitEditor(config));
+    if (config.type === 'line') {
+      body.appendChild(this._buildLineEditor(config));
+    } else {
+      // Type-specific controls first (the important stuff)
+      if (config.type === 'text') {
+        body.appendChild(this._buildTextEditor(config));
+      } else if (config.type === 'image') {
+        body.appendChild(this._buildImageEditor(config));
+      } else if (config.type === 'split') {
+        body.appendChild(this._buildSplitEditor(config));
+      }
+
+      // Design section
+      body.appendChild(this._buildDesignEditor(config));
+
+      // Shape section
+      body.appendChild(this._shapeEditor.buildShapeSection(config));
     }
 
-    // Design section
-    body.appendChild(this._buildDesignEditor(config));
-
-    // Shape section
-    body.appendChild(this._shapeEditor.buildShapeSection(config));
+    // Animation section (all element types)
+    body.appendChild(this._buildAnimationEditor(config));
 
     // Position info last
     const posSection = this._peSection('Position');
@@ -346,6 +392,10 @@ export class EditMode {
     posSection.appendChild(this._peReadonly('Row', config.gridRow));
     posSection.appendChild(this._peReadonly('Width', config.colSpan));
     posSection.appendChild(this._peReadonly('Height', config.rowSpan));
+    const layerInput = this._peNumberInput(config.layer || 1, 1, 10, 1, (v) => {
+      this.board.setLayer(config.id, v);
+    });
+    posSection.appendChild(this._peField('Layer', layerInput));
     body.appendChild(posSection);
 
     // Auto-open sidebar if not visible
@@ -413,21 +463,16 @@ export class EditMode {
     const section = this._peSection('Content');
     const content = config.content;
 
-    // Tag selector
-    const tagSelect = document.createElement('select');
-    tagSelect.classList.add('pe-input');
-    ['h1', 'h2', 'h3', 'p'].forEach(t => {
-      const opt = document.createElement('option');
-      opt.value = t;
-      opt.textContent = t.toUpperCase();
-      if (t === content.tag) opt.selected = true;
-      tagSelect.appendChild(opt);
-    });
-    tagSelect.addEventListener('change', () => {
-      content.tag = tagSelect.value;
+    // Font size (cqi) — migrate from legacy tag if needed
+    if (!content.fontSize) {
+      content.fontSize = { h1: 13, h2: 9, h3: 6.5 }[content.tag] ?? 4;
+      delete content.tag;
+    }
+    const fsInput = this._peNumberInput(content.fontSize, 1, 30, 0.5, (v) => {
+      content.fontSize = v;
       this._rebuildSelected();
     });
-    section.appendChild(this._peField('Tag', tagSelect));
+    section.appendChild(this._peField('Font size', fsInput));
 
     // Rich text editor for main text
     const richText = this._buildRichTextArea(content.text, (html) => {
@@ -436,12 +481,27 @@ export class EditMode {
     });
     section.appendChild(this._peField('Text', richText));
 
+    // Text color (stored on style for applyDesign to set on wrapper)
+    if (!config.style) config.style = {};
+    const tcInput = this._peColorInput(config.style.textColor || '#e8e8e8', (v) => {
+      config.style.textColor = v;
+      this.board.applyDesign(config.id);
+    });
+    section.appendChild(this._peField('Text color', tcInput));
+
     // Rich text editor for subtext
     const richSub = this._buildRichTextArea(content.subtext || '', (html) => {
       content.subtext = html || undefined;
       this._rebuildSelected();
     });
     section.appendChild(this._peField('Subtext', richSub));
+
+    // Subtext color
+    const stcInput = this._peColorInput(content.subtextColor || '#666666', (v) => {
+      content.subtextColor = v;
+      this._rebuildSelected();
+    });
+    section.appendChild(this._peField('Sub color', stcInput));
 
     // Horizontal alignment
     const hAlignSelect = document.createElement('select');
@@ -506,23 +566,12 @@ export class EditMode {
     const rotInput = this._peNumberInput(f.rotation, -180, 180, 1, (v) => { f.rotation = v; rebuild(); });
     section.appendChild(this._peField('Rotation', rotInput));
 
-    // Clip text toggle
-    const clipCheck = document.createElement('input');
-    clipCheck.type = 'checkbox';
-    clipCheck.checked = !!content.clipFrame;
-    clipCheck.addEventListener('change', () => {
-      content.clipFrame = clipCheck.checked;
-      rebuild();
-    });
-    section.appendChild(this._peField('Clip text', clipCheck));
-
     const resetBtn = document.createElement('button');
     resetBtn.classList.add('edit-btn');
     resetBtn.textContent = 'Reset Frame';
     resetBtn.style.marginTop = '4px';
     resetBtn.addEventListener('click', () => {
       content.frame = { x: 0, y: 0, width: 100, height: 100, rotation: 0 };
-      content.clipFrame = false;
       this._rebuildSelected();
       this._populatePanelEditor();
     });
@@ -530,7 +579,7 @@ export class EditMode {
 
     const hint = document.createElement('div');
     hint.classList.add('pe-hint');
-    hint.textContent = 'Double-click panel to edit frame interactively';
+    hint.textContent = 'Click & drag selected panel to move text frame. Double-click for resize/rotate handles.';
     section.appendChild(hint);
 
     return section;
@@ -648,7 +697,7 @@ export class EditMode {
       const newType = typeSelect.value;
       if (newType === 'text') {
         parentConfig.content[side] = {
-          type: 'text', tag: 'h2', text: 'New text',
+          type: 'text', fontSize: 9, text: 'New text',
           align: side === 'right' ? 'right' : 'left',
         };
       } else {
@@ -660,20 +709,16 @@ export class EditMode {
     wrap.appendChild(this._peField('Type', typeSelect));
 
     if (sideContent.type === 'text') {
-      const tagSelect = document.createElement('select');
-      tagSelect.classList.add('pe-input');
-      ['h1', 'h2', 'h3', 'p'].forEach(t => {
-        const opt = document.createElement('option');
-        opt.value = t;
-        opt.textContent = t.toUpperCase();
-        if (t === sideContent.tag) opt.selected = true;
-        tagSelect.appendChild(opt);
-      });
-      tagSelect.addEventListener('change', () => {
-        sideContent.tag = tagSelect.value;
+      // Font size (cqi) — migrate from legacy tag if needed
+      if (!sideContent.fontSize) {
+        sideContent.fontSize = { h1: 13, h2: 9, h3: 6.5 }[sideContent.tag] ?? 4;
+        delete sideContent.tag;
+      }
+      const fsInput = this._peNumberInput(sideContent.fontSize, 1, 30, 0.5, (v) => {
+        sideContent.fontSize = v;
         this._rebuildSelected();
       });
-      wrap.appendChild(this._peField('Tag', tagSelect));
+      wrap.appendChild(this._peField('Font size', fsInput));
 
       const richText = this._buildRichTextArea(sideContent.text, (html) => {
         sideContent.text = html;
@@ -686,6 +731,13 @@ export class EditMode {
         this._rebuildSelected();
       });
       wrap.appendChild(this._peField('Subtext', richSub));
+
+      // Subtext color
+      const stcInput = this._peColorInput(sideContent.subtextColor || '#666666', (v) => {
+        sideContent.subtextColor = v;
+        this._rebuildSelected();
+      });
+      wrap.appendChild(this._peField('Sub color', stcInput));
 
       const hAlignSelect = document.createElement('select');
       hAlignSelect.classList.add('pe-input');
@@ -890,13 +942,228 @@ export class EditMode {
       section.appendChild(this._peField('Bg color', bgInput));
     }
 
-    // Text color
-    const tcInput = this._peColorInput(s.textColor || '#e8e8e8', (v) => {
-      s.textColor = v;
+    return section;
+  }
+
+  // ── Line editor ──
+
+  _buildLineEditor(config) {
+    if (!config.style) config.style = {};
+    const s = config.style;
+    const section = this._peSection('Line', true);
+
+    const applyDesign = () => this.board.applyDesign(config.id);
+
+    // Thickness
+    const bwInput = this._peNumberInput(s.borderWidth ?? 2, 0, 40, 1, (v) => {
+      s.borderWidth = v;
       applyDesign();
     });
-    section.appendChild(this._peField('Text color', tcInput));
+    section.appendChild(this._peField('Thickness', bwInput));
 
+    // Color
+    const bcInput = this._peColorInput(s.borderColor || '#e8e8e8', (v) => {
+      s.borderColor = v;
+      applyDesign();
+    });
+    section.appendChild(this._peField('Color', bcInput));
+
+    // Smooth
+    const smoothCheck = document.createElement('input');
+    smoothCheck.type = 'checkbox';
+    smoothCheck.checked = !!s.smooth;
+    smoothCheck.addEventListener('change', () => {
+      s.smooth = smoothCheck.checked;
+      applyDesign();
+    });
+    section.appendChild(this._peField('Smooth', smoothCheck));
+
+    // Opacity
+    const opInput = document.createElement('input');
+    opInput.type = 'range';
+    opInput.classList.add('pe-input', 'pe-range');
+    opInput.min = '0';
+    opInput.max = '1';
+    opInput.step = '0.05';
+    opInput.value = s.opacity ?? 1;
+    opInput.addEventListener('input', () => {
+      s.opacity = parseFloat(opInput.value);
+      applyDesign();
+    });
+    section.appendChild(this._peField('Opacity', opInput));
+
+    // Anchor count
+    const anchors = config.content?.anchors || [];
+    section.appendChild(this._peReadonly('Anchors', `${anchors.length}`));
+
+    const hint = document.createElement('div');
+    hint.classList.add('pe-hint');
+    hint.textContent = 'Drag anchor to move · Right-click anchor to remove';
+    section.appendChild(hint);
+
+    return section;
+  }
+
+  // ── Animation editor ──
+
+  _buildAnimationEditor(config) {
+    const defaultDur = 0.6;
+    const defaultRow = config.gridRow;
+    if (!config.animation) config.animation = { enabled: false, entrance: 'fadeInUp', exit: 'none', scroll: 'none' };
+    const a = config.animation;
+    // Migrate legacy single duration to per-type durations
+    if (a.duration != null && a.entranceDuration == null) a.entranceDuration = a.duration;
+    if (a.duration != null && a.exitDuration == null) a.exitDuration = a.duration;
+    if (a.duration != null && a.scrollDuration == null) a.scrollDuration = a.duration;
+
+    const section = this._peSection('Animation');
+
+    // Enable toggle
+    const enableCheck = document.createElement('input');
+    enableCheck.type = 'checkbox';
+    enableCheck.checked = !!a.enabled;
+
+    const fields = document.createElement('div');
+    fields.style.display = a.enabled ? '' : 'none';
+
+    enableCheck.addEventListener('change', () => {
+      a.enabled = enableCheck.checked;
+      fields.style.display = a.enabled ? '' : 'none';
+    });
+    section.appendChild(this._peField('Enabled', enableCheck));
+
+    // Helper: build a paired row with trigger-row + duration side by side
+    const buildRowDurPair = (label, rowVal, durVal, onRow, onDur) => {
+      const pair = document.createElement('div');
+      pair.classList.add('pe-field');
+      const lbl = document.createElement('label');
+      lbl.classList.add('pe-label');
+      lbl.textContent = label;
+      const rowInput = this._peNumberInput(rowVal, 1, 999, 1, onRow);
+      const durLbl = document.createElement('span');
+      durLbl.textContent = 'Duration (s)';
+      durLbl.style.cssText = 'font-size:0.75rem;color:#888;white-space:nowrap;margin-left:0.25rem;';
+      const durInput = this._peNumberInput(durVal, 0.1, 3, 0.1, onDur);
+      pair.append(lbl, rowInput, durLbl, durInput);
+      return pair;
+    };
+
+    // Entrance effect
+    const entranceEffects = [
+      ['none', 'None'],
+      ['fadeIn', 'Fade in'],
+      ['fadeInUp', 'Fade in up'],
+      ['fadeInDown', 'Fade in down'],
+      ['fadeInLeft', 'Fade in left'],
+      ['fadeInRight', 'Fade in right'],
+      ['zoomIn', 'Zoom in'],
+      ['slideInUp', 'Slide in up'],
+      ['slideInLeft', 'Slide in left'],
+      ['slideInRight', 'Slide in right'],
+      ['flipInX', 'Flip in'],
+    ];
+    const entranceSel = document.createElement('select');
+    entranceSel.classList.add('pe-input');
+    entranceEffects.forEach(([val, lbl]) => {
+      const opt = document.createElement('option');
+      opt.value = val; opt.textContent = lbl;
+      if (a.entrance === val) opt.selected = true;
+      entranceSel.appendChild(opt);
+    });
+    entranceSel.addEventListener('change', () => { a.entrance = entranceSel.value; });
+    fields.appendChild(this._peField('Entrance', entranceSel));
+
+    // Entrance row + duration
+    fields.appendChild(buildRowDurPair(
+      'Entrance row',
+      a.triggerRow ?? defaultRow,
+      a.entranceDuration ?? defaultDur,
+      (v) => { a.triggerRow = v; },
+      (v) => { a.entranceDuration = v; },
+    ));
+
+    // Exit effect
+    const exitEffects = [
+      ['none', 'None'],
+      ['fadeOut', 'Fade out'],
+      ['fadeOutDown', 'Fade out down'],
+      ['fadeOutUp', 'Fade out up'],
+      ['zoomOut', 'Zoom out'],
+    ];
+    const exitSel = document.createElement('select');
+    exitSel.classList.add('pe-input');
+    exitEffects.forEach(([val, lbl]) => {
+      const opt = document.createElement('option');
+      opt.value = val; opt.textContent = lbl;
+      if (a.exit === val) opt.selected = true;
+      exitSel.appendChild(opt);
+    });
+    exitSel.addEventListener('change', () => { a.exit = exitSel.value; });
+    fields.appendChild(this._peField('Exit', exitSel));
+
+    // Exit row + duration
+    fields.appendChild(buildRowDurPair(
+      'Exit row',
+      a.exitTriggerRow ?? a.triggerRow ?? defaultRow,
+      a.exitDuration ?? defaultDur,
+      (v) => { a.exitTriggerRow = v; },
+      (v) => { a.exitDuration = v; },
+    ));
+
+    // Scroll effect
+    const scrollEffects = [
+      ['none', 'None'],
+      ['pulse', 'Pulse'],
+      ['shake', 'Shake'],
+      ['bounce', 'Bounce'],
+      ['wiggle', 'Wiggle'],
+      ['float', 'Float'],
+      ['spin', 'Spin'],
+      ['flash', 'Flash'],
+    ];
+    const scrollSel = document.createElement('select');
+    scrollSel.classList.add('pe-input');
+    scrollEffects.forEach(([val, lbl]) => {
+      const opt = document.createElement('option');
+      opt.value = val; opt.textContent = lbl;
+      if (a.scroll === val) opt.selected = true;
+      scrollSel.appendChild(opt);
+    });
+    scrollSel.addEventListener('change', () => { a.scroll = scrollSel.value; });
+    fields.appendChild(this._peField('Scroll effect', scrollSel));
+
+    // Scroll row + duration
+    fields.appendChild(buildRowDurPair(
+      'Scroll row',
+      a.scrollTriggerRow ?? a.triggerRow ?? defaultRow,
+      a.scrollDuration ?? defaultDur,
+      (v) => { a.scrollTriggerRow = v; },
+      (v) => { a.scrollDuration = v; },
+    ));
+
+    // Preview button
+    const previewBtn = document.createElement('button');
+    previewBtn.classList.add('pe-input');
+    previewBtn.textContent = 'Preview';
+    previewBtn.style.cursor = 'pointer';
+    previewBtn.style.marginTop = '0.25rem';
+    previewBtn.addEventListener('click', () => {
+      const entry = this.board.elements.get(config.id);
+      if (!entry) return;
+      const { wrapper } = entry;
+      let effect, dur;
+      if (a.entrance && a.entrance !== 'none') { effect = a.entrance; dur = a.entranceDuration; }
+      else if (a.scroll && a.scroll !== 'none') { effect = a.scroll; dur = a.scrollDuration; }
+      else { effect = a.exit; dur = a.exitDuration; }
+      if (!effect || effect === 'none') return;
+      wrapper.style.animation = '';
+      void wrapper.offsetWidth;
+      wrapper.style.animation = `anim-${effect} ${dur ?? defaultDur}s ease both`;
+      wrapper.addEventListener('animationend', () => { wrapper.style.animation = ''; }, { once: true });
+    });
+    fields.appendChild(previewBtn);
+
+    section.appendChild(fields);
     return section;
   }
 
@@ -906,22 +1173,28 @@ export class EditMode {
     const section = document.createElement('div');
     section.classList.add('pe-section');
 
+    // Restore previous open/closed state if available
+    const remembered = this._sectionStates && this._sectionStates.has(title);
+    const isOpen = remembered ? this._sectionStates.get(title) : startOpen;
+
     const heading = document.createElement('div');
     heading.classList.add('pe-section-title');
 
     const arrow = document.createElement('span');
     arrow.classList.add('pe-section-arrow');
-    arrow.textContent = startOpen ? '\u25BC' : '\u25B6';
+    arrow.textContent = isOpen ? '\u25BC' : '\u25B6';
 
     heading.append(arrow, ` ${title}`);
 
     const content = document.createElement('div');
     content.classList.add('pe-section-body');
-    if (!startOpen) content.classList.add('pe-collapsed');
+    if (!isOpen) content.classList.add('pe-collapsed');
 
     heading.addEventListener('click', () => {
       const collapsed = content.classList.toggle('pe-collapsed');
       arrow.textContent = collapsed ? '\u25B6' : '\u25BC';
+      if (!this._sectionStates) this._sectionStates = new Map();
+      this._sectionStates.set(title, !collapsed);
     });
 
     section.append(heading, content);
@@ -1003,11 +1276,11 @@ export class EditMode {
     this._exitFrameEdit();
 
     const defaults = {
-      text: { tag: 'h2', text: 'New text' },
+      text: { fontSize: 9, text: 'New text' },
       image: { src: '/placeholder.svg', alt: 'New image' },
       split: {
         ratio: 0.5, angle: 0,
-        left: { type: 'text', tag: 'h2', text: 'Left' },
+        left: { type: 'text', fontSize: 9, text: 'Left' },
         right: { type: 'image', src: '/placeholder.svg', alt: 'Right' },
       },
     };
@@ -1063,7 +1336,6 @@ export class EditMode {
     container.classList.add('text-frame-container');
     container.style.gridColumn = `${config.gridColumn} / span ${config.colSpan || 1}`;
     container.style.gridRow = `${config.gridRow} / span ${config.rowSpan || 1}`;
-    container.style.transform = composeTransform(config.style);
 
     const overlay = document.createElement('div');
     overlay.classList.add('text-frame-overlay');
@@ -1133,6 +1405,43 @@ export class EditMode {
     }
   }
 
+  /** Drag the text frame directly when the panel is already selected.
+   *  No clamping — the panel clips via overflow:hidden. */
+  _startInlineFrameDrag(id, wrapper, e) {
+    const entry = this.board.elements.get(id);
+    if (!entry) return;
+    const content = entry.config.content;
+    if (!content.frame) content.frame = { x: 0, y: 0, width: 100, height: 100, rotation: 0 };
+    const f = content.frame;
+    const rect = wrapper.getBoundingClientRect();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startFx = f.x;
+    const startFy = f.y;
+
+    wrapper.setPointerCapture(e.pointerId);
+    wrapper.style.cursor = 'grabbing';
+
+    const onMove = (me) => {
+      const dx = ((me.clientX - startX) / rect.width) * 100;
+      const dy = ((me.clientY - startY) / rect.height) * 100;
+      f.x = Math.round(startFx + dx);
+      f.y = Math.round(startFy + dy);
+      this._applyFrameStyle(id);
+    };
+
+    const onUp = () => {
+      wrapper.releasePointerCapture(e.pointerId);
+      wrapper.removeEventListener('pointermove', onMove);
+      wrapper.removeEventListener('pointerup', onUp);
+      wrapper.style.cursor = '';
+      this._populatePanelEditor();
+    };
+
+    wrapper.addEventListener('pointermove', onMove);
+    wrapper.addEventListener('pointerup', onUp);
+  }
+
   _startFrameDrag(id, overlay, e) {
     const entry = this.board.elements.get(id);
     if (!entry) return;
@@ -1149,8 +1458,8 @@ export class EditMode {
     const onMove = (me) => {
       const dx = ((me.clientX - startX) / rect.width) * 100;
       const dy = ((me.clientY - startY) / rect.height) * 100;
-      f.x = Math.round(Math.max(0, Math.min(100 - f.width, startFx + dx)));
-      f.y = Math.round(Math.max(0, Math.min(100 - f.height, startFy + dy)));
+      f.x = Math.round(startFx + dx);
+      f.y = Math.round(startFy + dy);
       overlay.style.left = `${f.x}%`;
       overlay.style.top = `${f.y}%`;
       this._applyFrameStyle(id);
@@ -1289,6 +1598,15 @@ export class EditMode {
       line.classList.add('edit-grid-line', 'edit-grid-line-h');
       line.style.top = `${i * cellH - gap / 2}px`;
       overlay.appendChild(line);
+
+      // Row number label in the left margin
+      if (i > 0 && i <= rowCount) {
+        const label = document.createElement('div');
+        label.classList.add('edit-row-label');
+        label.textContent = i;
+        label.style.top = `${(i - 1) * cellH}px`;
+        overlay.appendChild(label);
+      }
     }
 
     this.board.container.style.position = 'relative';
@@ -1325,6 +1643,27 @@ export class EditMode {
   _makeEditable(wrapper, config) {
     wrapper.classList.add('edit-element');
 
+    // Lines: wrapper has pointer-events:none; only the SVG stroke is hit.
+    // Clicking the path selects the line and starts a whole-line drag.
+    // Alt+click on the path inserts a new anchor at that point.
+    // Anchor handles get their own pointerdown handler and stop propagation.
+    if (config.type === 'line') {
+      wrapper.addEventListener('pointerdown', wrapper._editDragStart = (e) => {
+        if (e.button !== 0) return;
+        if (e.target.closest('.line-anchor')) return;
+        if (!e.target.closest('.line-path')) return;
+        e.preventDefault();
+        e.stopPropagation();
+        this._selectElement(config.id);
+        if (e.altKey) {
+          this._addLineAnchorAtPoint(config.id, e.clientX, e.clientY);
+          return;
+        }
+        this._startLineDrag(config.id, e);
+      }, true);
+      return;
+    }
+
     // Use a capturing listener on the wrapper so it fires before any child elements
     // can interfere (important for split blocks with absolute-positioned sides)
     wrapper.addEventListener('pointerdown', wrapper._editDragStart = (e) => {
@@ -1345,6 +1684,13 @@ export class EditMode {
       if (this._frameEditId === config.id) {
         this._exitFrameEdit();
         e.preventDefault();
+        return;
+      }
+
+      // Already-selected text panel: drag the text frame instead of the panel
+      if (config.type === 'text' && this._selectedId === config.id) {
+        e.preventDefault();
+        this._startInlineFrameDrag(config.id, wrapper, e);
         return;
       }
 
@@ -1594,20 +1940,19 @@ export class EditMode {
     if (clickedElement) {
       const id = clickedElement.dataset.id;
 
-      this._addSubmenu(menu, 'Order', [
-        { label: 'Bring to front', action: () => { this._setLayer(id, 'front'); this._dismissMenu(); } },
-        { label: 'Bring forward', action: () => { this._setLayer(id, 'up'); this._dismissMenu(); } },
-        { label: 'Send backward', action: () => { this._setLayer(id, 'down'); this._dismissMenu(); } },
-        { label: 'Send to back', action: () => { this._setLayer(id, 'back'); this._dismissMenu(); } },
-      ]);
-
-      this._addSubmenu(menu, 'Transform', [
-        { label: 'Rotate 90° CW', action: () => { this._applyTransform(id, 'rotate', 90); this._dismissMenu(); } },
-        { label: 'Rotate 90° CCW', action: () => { this._applyTransform(id, 'rotate', -90); this._dismissMenu(); } },
-        { label: 'Flip horizontal', action: () => { this._applyTransform(id, 'flipX'); this._dismissMenu(); } },
-        { label: 'Flip vertical', action: () => { this._applyTransform(id, 'flipY'); this._dismissMenu(); } },
-        { label: 'Reset', action: () => { this._applyTransform(id, 'reset'); this._dismissMenu(); } },
-      ]);
+      {
+        const entry = this.board.elements.get(id);
+        const currentLayer = entry ? (entry.config.layer || 1) : 1;
+        const layerItems = [];
+        for (let i = 1; i <= 10; i++) {
+          const label = i === currentLayer ? `Layer ${i}  ●` : `Layer ${i}`;
+          layerItems.push({
+            label,
+            action: () => { this.board.setLayer(id, i); this._dismissMenu(); },
+          });
+        }
+        this._addSubmenu(menu, 'Layer', layerItems);
+      }
 
       this._addMenuItem(menu, 'Duplicate panel', () => {
         const entry = this.board.elements.get(id);
@@ -1641,6 +1986,16 @@ export class EditMode {
             this._dismissMenu();
           },
         })));
+      });
+
+      this._addMenuItem(menu, 'Add line', () => {
+        this._enterLineMode();
+        this._dismissMenu();
+      });
+
+      this._addMenuItem(menu, 'Background settings', () => {
+        this._dismissMenu();
+        this._openBackgroundDialog();
       });
     }
 
@@ -1750,8 +2105,8 @@ export class EditMode {
     if (!this._selectedId) return;
     if (this.dragging || this.resizing) return;
     if (e.target.closest(
-      '.peg-element, .shape-bounds, .text-frame-overlay, .shape-anchor, ' +
-      '.edit-context-menu, .panel-editor, .edit-bar'
+      '.peg-element, .shape-bounds, .line-bounds, .text-frame-overlay, ' +
+      '.shape-anchor, .line-anchor, .edit-context-menu, .panel-editor, .edit-bar'
     )) return;
     this._selectElement(null);
   }
@@ -1845,11 +2200,11 @@ export class EditMode {
 
   _createPanel(type, col, row, colSpan, rowSpan, shapePreset = 'rectangle') {
     const defaults = {
-      text: { tag: 'h2', text: 'New text' },
+      text: { fontSize: 9, text: 'New text' },
       image: { src: '/placeholder.svg', alt: 'New image' },
       split: {
         ratio: 0.5, angle: 0,
-        left: { type: 'text', tag: 'h2', text: 'Left' },
+        left: { type: 'text', fontSize: 9, text: 'Left' },
         right: { type: 'image', src: '/placeholder.svg', alt: 'Right' },
       },
     };
@@ -1888,66 +2243,369 @@ export class EditMode {
     }
   }
 
-  // ── Layer ordering ──
+  // ── Line draw mode ──
 
-  _setLayer(id, mode) {
-    const entry = this.board.elements.get(id);
-    if (!entry) return;
+  _enterLineMode() {
+    this._cancelLineMode();
+    this._lineMode = { anchors: [] };
+    this.board.container.classList.add('edit-line-mode');
+    this._flash('Click to add anchors · Right-click to undo · Esc to finish');
 
-    const all = [];
-    this.board.elements.forEach(({ config }) => all.push(config));
+    this._onLineModeDown = (e) => this._lineModeDown(e);
+    this._onLineModeContextMenu = (e) => this._lineModeRightClick(e);
+    this._onLineModeKey = (e) => this._lineModeKey(e);
 
-    const indices = all.map(c => c.zIndex ?? 0);
-    const current = entry.config.zIndex ?? 0;
-    const minZ = Math.min(...indices);
-    const maxZ = Math.max(...indices);
+    // Capture pointerdown before panel handlers
+    this.board.container.addEventListener('pointerdown', this._onLineModeDown, true);
+    this.board.container.addEventListener('contextmenu', this._onLineModeContextMenu, true);
+    document.addEventListener('keydown', this._onLineModeKey);
 
-    switch (mode) {
-      case 'front':
-        entry.config.zIndex = maxZ + 1;
-        break;
-      case 'back':
-        entry.config.zIndex = minZ - 1;
-        break;
-      case 'up': {
-        const above = indices.filter(z => z > current);
-        entry.config.zIndex = above.length ? Math.min(...above) + 1 : current + 1;
-        break;
-      }
-      case 'down': {
-        const below = indices.filter(z => z < current);
-        entry.config.zIndex = below.length ? Math.max(...below) - 1 : current - 1;
-        break;
-      }
-    }
-
-    entry.wrapper.style.zIndex = entry.config.zIndex;
+    this._createLineGhost();
   }
 
-  // ── Panel transform (rotate 90° steps + flips) ──
+  _cancelLineMode() {
+    if (!this._lineMode) return;
+    this.board.container.classList.remove('edit-line-mode');
+    this.board.container.removeEventListener('pointerdown', this._onLineModeDown, true);
+    this.board.container.removeEventListener('contextmenu', this._onLineModeContextMenu, true);
+    document.removeEventListener('keydown', this._onLineModeKey);
+    this._removeLineGhost();
+    this._lineMode = null;
+  }
 
-  _applyTransform(id, op, value) {
+  _lineModeDown(e) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = this.board.container.getBoundingClientRect();
+    const pt = this._clientToGridCoords(e.clientX, e.clientY, rect);
+    this._lineMode.anchors.push(pt);
+    this._updateLineGhost();
+  }
+
+  _lineModeRightClick(e) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (this._lineMode.anchors.length > 0) {
+      this._lineMode.anchors.pop();
+      this._updateLineGhost();
+    }
+  }
+
+  _lineModeKey(e) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      this._finalizeLine();
+    }
+  }
+
+  _createLineGhost() {
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(ns, 'svg');
+    svg.classList.add('line-ghost');
+    svg.setAttribute('preserveAspectRatio', 'none');
+    this.board.container.appendChild(svg);
+    this._lineGhost = svg;
+    this._updateLineGhost();
+  }
+
+  _removeLineGhost() {
+    if (this._lineGhost) {
+      this._lineGhost.remove();
+      this._lineGhost = null;
+    }
+  }
+
+  _updateLineGhost() {
+    if (!this._lineGhost || !this._lineMode) return;
+    while (this._lineGhost.firstChild) this._lineGhost.firstChild.remove();
+
+    const anchors = this._lineMode.anchors;
+    const cols = this.board.columns;
+    const maxY = anchors.length ? Math.max(...anchors.map(a => a.y)) : 1;
+    const rowSpan = Math.max(1, Math.ceil(maxY) + 1);
+
+    this._lineGhost.style.gridColumn = `1 / span ${cols}`;
+    this._lineGhost.style.gridRow = `1 / span ${rowSpan}`;
+
+    const w = this._lineGhost.clientWidth;
+    const h = this._lineGhost.clientHeight;
+    if (w === 0 || h === 0) return;
+
+    this._lineGhost.setAttribute('viewBox', `0 0 ${w} ${h}`);
+
+    const pts = anchors.map(a => this.board.gridToPixel(a.x, a.y));
+
+    const ns = 'http://www.w3.org/2000/svg';
+    if (pts.length >= 2) {
+      const path = document.createElementNS(ns, 'path');
+      path.setAttribute('d', pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x},${p.y}`).join(' '));
+      path.setAttribute('fill', 'none');
+      path.setAttribute('stroke', '#64a0ff');
+      path.setAttribute('stroke-width', '2');
+      path.setAttribute('stroke-dasharray', '4,3');
+      this._lineGhost.appendChild(path);
+    }
+    pts.forEach(p => {
+      const c = document.createElementNS(ns, 'circle');
+      c.setAttribute('cx', p.x);
+      c.setAttribute('cy', p.y);
+      c.setAttribute('r', '5');
+      c.setAttribute('fill', '#64a0ff');
+      this._lineGhost.appendChild(c);
+    });
+  }
+
+  _finalizeLine() {
+    if (!this._lineMode) return;
+    const anchors = this._lineMode.anchors.slice();
+    this._cancelLineMode();
+
+    if (anchors.length < 2) return;
+
+    const maxY = Math.max(...anchors.map(a => a.y));
+    const rowSpan = Math.max(1, Math.ceil(maxY));
+
+    const config = {
+      id: uniqueId('line'),
+      type: 'line',
+      gridColumn: 1,
+      gridRow: 1,
+      colSpan: this.board.columns,
+      rowSpan,
+      content: { anchors },
+      style: {
+        borderWidth: 2,
+        borderColor: '#e8e8e8',
+        smooth: false,
+      },
+    };
+
+    this.board.addElement(config);
+    const entry = this.board.elements.get(config.id);
+    if (entry) {
+      this._makeEditable(entry.wrapper, entry.config);
+      this._selectElement(config.id);
+    }
+  }
+
+  /** Convert a client point to absolute grid coordinates (half-grid snap). */
+  _clientToGridCoords(clientX, clientY, containerRect) {
+    const px = clientX - containerRect.left;
+    const py = clientY - containerRect.top;
+    const { x, y } = this.board.pixelToGrid(px, py);
+    let gx = Math.round(x * 2) / 2;
+    let gy = Math.round(y * 2) / 2;
+    gx = Math.max(0, Math.min(this.board.columns, gx));
+    gy = Math.max(0, gy);
+    return { x: gx, y: gy };
+  }
+
+  // ── Line anchor editing ──
+
+  _renderLineAnchors(id) {
+    this._removeLineAnchors();
     const entry = this.board.elements.get(id);
     if (!entry) return;
-    if (!entry.config.style) entry.config.style = {};
-    const s = entry.config.style;
+    const { config } = entry;
+    const anchors = config.content?.anchors || [];
 
-    if (op === 'rotate') {
-      const current = s.rotation || 0;
-      s.rotation = ((current + value) % 360 + 360) % 360;
-    } else if (op === 'flipX') {
-      s.flipX = !s.flipX;
-    } else if (op === 'flipY') {
-      s.flipY = !s.flipY;
-    } else if (op === 'reset') {
-      s.rotation = 0;
-      s.flipX = false;
-      s.flipY = false;
+    const overlay = document.createElement('div');
+    overlay.classList.add('line-bounds');
+    overlay.style.gridColumn = `${config.gridColumn} / span ${config.colSpan || 1}`;
+    overlay.style.gridRow = `${config.gridRow} / span ${config.rowSpan || 1}`;
+    overlay.style.translate = entry.wrapper.style.translate;
+    this.board.container.appendChild(overlay);
+    this._lineBounds = overlay;
+    this._lineAnchorHandles = [];
+
+    anchors.forEach((a, i) => {
+      const handle = document.createElement('div');
+      handle.classList.add('line-anchor');
+      const p = this.board.gridToPixel(a.x, a.y);
+      handle.style.left = `${p.x}px`;
+      handle.style.top = `${p.y}px`;
+
+      handle.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        this._startLineAnchorDrag(id, i, handle, e);
+      });
+
+      handle.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this._removeLineAnchor(id, i);
+      });
+
+      overlay.appendChild(handle);
+      this._lineAnchorHandles.push(handle);
+    });
+  }
+
+  _removeLineAnchors() {
+    if (this._lineBounds) {
+      this._lineBounds.remove();
+      this._lineBounds = null;
     }
+    this._lineAnchorHandles = [];
+  }
 
+  _startLineDrag(id, e) {
+    const entry = this.board.elements.get(id);
+    if (!entry) return;
+    const { config } = entry;
+    const startAnchors = (config.content?.anchors || []).map(a => ({ x: a.x, y: a.y }));
+    if (startAnchors.length < 2) return;
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const minX = Math.min(...startAnchors.map(a => a.x));
+    const minY = Math.min(...startAnchors.map(a => a.y));
+
+    // Window-level listeners — SVG path pointer capture is unreliable
+    // (pointer-events: stroke means non-stroke pixels don't dispatch moves).
+    const onMove = (me) => {
+      const g = this.board.pixelToGrid(me.clientX - startX, me.clientY - startY);
+      // Snap delta to half-grid units so anchors keep their grid alignment
+      let dCol = Math.round(g.x * 2) / 2;
+      let dRow = Math.round(g.y * 2) / 2;
+      if (minX + dCol < 0) dCol = -minX;
+      if (minY + dRow < 0) dRow = -minY;
+      config.content.anchors = startAnchors.map(a => ({
+        x: a.x + dCol,
+        y: a.y + dRow,
+      }));
+      this._ensureLineRowSpan(config);
+      this.board.applyDesign(id);
+      this._syncLineBounds(id);
+      this._updateLineAnchorPositions(id);
+    };
+
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      this._populatePanelEditor();
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
+
+  _addLineAnchorAtPoint(id, clientX, clientY) {
+    const entry = this.board.elements.get(id);
+    if (!entry) return;
+    const { config } = entry;
+    const anchors = config.content?.anchors || [];
+    if (anchors.length < 2) return;
+
+    const rect = this.board.container.getBoundingClientRect();
+    const pt = this._clientToGridCoords(clientX, clientY, rect);
+
+    // Project click onto each segment, insert at the closest one
+    let bestSeg = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i < anchors.length - 1; i++) {
+      const a = anchors[i];
+      const b = anchors[i + 1];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const lenSq = dx * dx + dy * dy;
+      if (lenSq === 0) continue;
+      let t = ((pt.x - a.x) * dx + (pt.y - a.y) * dy) / lenSq;
+      t = Math.max(0, Math.min(1, t));
+      const px = a.x + t * dx;
+      const py = a.y + t * dy;
+      const d = (pt.x - px) ** 2 + (pt.y - py) ** 2;
+      if (d < bestDist) {
+        bestDist = d;
+        bestSeg = i;
+      }
+    }
+    anchors.splice(bestSeg + 1, 0, pt);
+    this._ensureLineRowSpan(config);
     this.board.applyDesign(id);
-    if (this._selectedId === id) this._syncBoundsOverlay();
+    this._renderLineAnchors(id);
+    this._populatePanelEditor();
   }
+
+  _startLineAnchorDrag(id, index, handle, e) {
+    const entry = this.board.elements.get(id);
+    if (!entry) return;
+
+    handle.classList.add('is-dragging');
+    handle.setPointerCapture(e.pointerId);
+
+    const onMove = (me) => {
+      const rect = this.board.container.getBoundingClientRect();
+      const pt = this._clientToGridCoords(me.clientX, me.clientY, rect);
+      entry.config.content.anchors[index] = pt;
+      this._ensureLineRowSpan(entry.config);
+      this.board.applyDesign(id);
+      this._syncLineBounds(id);
+      this._updateLineAnchorPositions(id);
+    };
+
+    const onUp = () => {
+      handle.classList.remove('is-dragging');
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', onUp);
+      this._populatePanelEditor();
+    };
+
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+  }
+
+  _removeLineAnchor(id, index) {
+    const entry = this.board.elements.get(id);
+    if (!entry) return;
+    const anchors = entry.config.content?.anchors;
+    if (!anchors || anchors.length <= 2) return;
+    anchors.splice(index, 1);
+    this._ensureLineRowSpan(entry.config);
+    this.board.applyDesign(id);
+    this._renderLineAnchors(id);
+    this._populatePanelEditor();
+  }
+
+  _ensureLineRowSpan(config) {
+    const anchors = config.content?.anchors || [];
+    if (anchors.length === 0) return;
+    const maxY = Math.max(...anchors.map(a => a.y));
+    const needed = Math.max(1, Math.ceil(maxY));
+    if (needed !== config.rowSpan) {
+      config.rowSpan = needed;
+      const entry = this.board.elements.get(config.id);
+      if (entry) {
+        entry.wrapper.style.gridRow = `${config.gridRow} / span ${needed}`;
+      }
+    }
+  }
+
+  _syncLineBounds(id) {
+    if (!this._lineBounds) return;
+    const config = this.board.elements.get(id)?.config;
+    if (!config) return;
+    this._lineBounds.style.gridColumn = `${config.gridColumn} / span ${config.colSpan || 1}`;
+    this._lineBounds.style.gridRow = `${config.gridRow} / span ${config.rowSpan || 1}`;
+  }
+
+  _updateLineAnchorPositions(id) {
+    const config = this.board.elements.get(id)?.config;
+    if (!config || !this._lineAnchorHandles) return;
+    const anchors = config.content?.anchors || [];
+    anchors.forEach((a, i) => {
+      const handle = this._lineAnchorHandles[i];
+      if (!handle) return;
+      const p = this.board.gridToPixel(a.x, a.y);
+      handle.style.left = `${p.x}px`;
+      handle.style.top = `${p.y}px`;
+    });
+  }
+
+  // ── Layer ordering (handled by PegBoard.setLayer) ──
 
   // ── Cell math ──
 
@@ -1960,6 +2618,176 @@ export class EditMode {
       col: Math.max(1, Math.floor(x / cellW) + 1),
       row: Math.max(1, Math.floor(y / cellH) + 1),
     };
+  }
+
+  // ── Background settings dialog ──
+
+  _openBackgroundDialog() {
+    // Snapshot current background so Cancel can revert
+    const original = this.board.background
+      ? JSON.parse(JSON.stringify(this.board.background))
+      : null;
+    const state = original
+      ? { ...original }
+      : { type: 'solid', color1: '#0a0a0a', color2: '#1a1a3a', angle: 135, preset: 'flow' };
+    // Ensure defaults exist for fields that may be missing
+    state.color1 = state.color1 || '#0a0a0a';
+    state.color2 = state.color2 || '#1a1a3a';
+    state.angle = state.angle ?? 135;
+    state.preset = state.preset || 'flow';
+
+    const backdrop = document.createElement('div');
+    backdrop.classList.add('bg-modal-backdrop');
+
+    const modal = document.createElement('div');
+    modal.classList.add('bg-modal');
+
+    const header = document.createElement('div');
+    header.classList.add('bg-modal-header');
+    const title = document.createElement('div');
+    title.classList.add('bg-modal-title');
+    title.textContent = 'Background settings';
+    const closeBtn = document.createElement('button');
+    closeBtn.classList.add('bg-modal-close');
+    closeBtn.textContent = '\u2715';
+    header.append(title, closeBtn);
+    modal.appendChild(header);
+
+    const mkField = (labelText) => {
+      const row = document.createElement('div');
+      row.classList.add('bg-modal-field');
+      const label = document.createElement('label');
+      label.textContent = labelText;
+      row.appendChild(label);
+      modal.appendChild(row);
+      return row;
+    };
+
+    // Type
+    const typeRow = mkField('Type');
+    const typeSel = document.createElement('select');
+    [
+      ['solid', 'Solid'],
+      ['gradient', 'Gradient'],
+      ['animated', 'Animated'],
+    ].forEach(([val, lbl]) => {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = lbl;
+      if (state.type === val) opt.selected = true;
+      typeSel.appendChild(opt);
+    });
+    typeRow.appendChild(typeSel);
+
+    // Color 1
+    const color1Row = mkField('Color');
+    const color1Input = document.createElement('input');
+    color1Input.type = 'color';
+    color1Input.value = state.color1;
+    color1Row.appendChild(color1Input);
+
+    // Color 2
+    const color2Row = mkField('Color 2');
+    const color2Input = document.createElement('input');
+    color2Input.type = 'color';
+    color2Input.value = state.color2;
+    color2Row.appendChild(color2Input);
+
+    // Angle
+    const angleRow = mkField('Angle');
+    const angleInput = document.createElement('input');
+    angleInput.type = 'number';
+    angleInput.min = '0';
+    angleInput.max = '360';
+    angleInput.step = '1';
+    angleInput.value = state.angle;
+    angleRow.appendChild(angleInput);
+
+    // Preset
+    const presetRow = mkField('Animation');
+    const presetSel = document.createElement('select');
+    [
+      ['flow', 'Flow (horizontal pan)'],
+      ['aurora', 'Aurora (diagonal drift)'],
+    ].forEach(([val, lbl]) => {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = lbl;
+      if (state.preset === val) opt.selected = true;
+      presetSel.appendChild(opt);
+    });
+    presetRow.appendChild(presetSel);
+
+    // Parallax depth
+    state.parallax = state.parallax ?? 0;
+    const parallaxRow = mkField('Parallax');
+    const parallaxSlider = document.createElement('input');
+    parallaxSlider.type = 'range';
+    parallaxSlider.min = '0';
+    parallaxSlider.max = '1';
+    parallaxSlider.step = '0.05';
+    parallaxSlider.value = state.parallax;
+    parallaxSlider.classList.add('bg-modal-range');
+    const parallaxVal = document.createElement('span');
+    parallaxVal.classList.add('bg-modal-range-val');
+    parallaxVal.textContent = state.parallax.toFixed(2);
+    parallaxRow.append(parallaxSlider, parallaxVal);
+
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+
+    const syncVisibility = () => {
+      const t = state.type;
+      color1Row.classList.toggle('is-hidden', false);
+      // Color 1 label text tweaks for solid vs. gradient
+      color1Row.querySelector('label').textContent = t === 'solid' ? 'Color' : 'Color 1';
+      color2Row.classList.toggle('is-hidden', t === 'solid');
+      angleRow.classList.toggle('is-hidden', t === 'solid');
+      presetRow.classList.toggle('is-hidden', t !== 'animated');
+      // Parallax only makes sense for non-solid types
+      parallaxRow.classList.toggle('is-hidden', t === 'solid');
+    };
+
+    const apply = () => {
+      this.board.background = { ...state };
+      this.board.applyBackground();
+    };
+
+    syncVisibility();
+    apply();
+
+    typeSel.addEventListener('change', () => {
+      state.type = typeSel.value;
+      syncVisibility();
+      apply();
+    });
+    color1Input.addEventListener('input', () => { state.color1 = color1Input.value; apply(); });
+    color2Input.addEventListener('input', () => { state.color2 = color2Input.value; apply(); });
+    angleInput.addEventListener('input', () => {
+      const v = parseInt(angleInput.value, 10);
+      if (!Number.isNaN(v)) { state.angle = v; apply(); }
+    });
+    presetSel.addEventListener('change', () => { state.preset = presetSel.value; apply(); });
+    parallaxSlider.addEventListener('input', () => {
+      state.parallax = parseFloat(parallaxSlider.value);
+      parallaxVal.textContent = state.parallax.toFixed(2);
+      apply();
+    });
+
+    const close = (save) => {
+      if (save) {
+        this._saveLayout();
+      } else {
+        this.board.background = original;
+        this.board.applyBackground();
+      }
+      backdrop.remove();
+    };
+
+    closeBtn.addEventListener('click', () => close(true));
+    backdrop.addEventListener('pointerdown', (e) => {
+      if (e.target === backdrop) close(true);
+    });
   }
 
   // ── Save layout to disk (dev server only) ──
