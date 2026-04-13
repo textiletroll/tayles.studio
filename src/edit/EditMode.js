@@ -1578,11 +1578,13 @@ export class EditMode {
     const overlay = document.createElement('div');
     overlay.classList.add('edit-grid-overlay');
 
-    const rect = this.board.container.getBoundingClientRect();
+    // Use clientWidth/clientHeight (unzoomed) since the overlay is inside the container
+    const cw = this.board.container.clientWidth;
+    const ch = this.board.container.clientHeight;
     const cols = this.board.columns;
     const gap = this.board.gap;
     const totalGap = (cols - 1) * gap;
-    const colWidth = (rect.width - totalGap) / cols;
+    const colWidth = (cw - totalGap) / cols;
 
     for (let i = 0; i <= cols; i++) {
       const line = document.createElement('div');
@@ -1592,7 +1594,7 @@ export class EditMode {
     }
 
     const cellH = this.board.rowHeight + gap;
-    const rowCount = Math.ceil(rect.height / cellH) + 4;
+    const rowCount = Math.ceil(ch / cellH) + 4;
     for (let i = 0; i <= rowCount; i++) {
       const line = document.createElement('div');
       line.classList.add('edit-grid-line', 'edit-grid-line-h');
@@ -1734,7 +1736,8 @@ export class EditMode {
     const containerRect = this.board.container.getBoundingClientRect();
     const config = this.board.elements.get(id).config;
     const cellW = containerRect.width / this.board.columns;
-    const cellH = this.board.rowHeight + this.board.gap;
+    const zoom = this.board._zoomFactor || 1;
+    const cellH = (this.board.rowHeight + this.board.gap) * zoom;
 
     const elLeft = (config.gridColumn - 1) * cellW + containerRect.left;
     const elTop = (config.gridRow - 1) * cellH + containerRect.top;
@@ -1835,7 +1838,8 @@ export class EditMode {
     const { edge, startX, startY, startCol, startRow, startColSpan, startRowSpan, id, wrapper } = this.resizing;
     const containerRect = this.board.container.getBoundingClientRect();
     const cellW = containerRect.width / this.board.columns;
-    const cellH = this.board.rowHeight + this.board.gap;
+    const zoom = this.board._zoomFactor || 1;
+    const cellH = (this.board.rowHeight + this.board.gap) * zoom;
 
     const dCols = Math.round((e.clientX - startX) / cellW);
     const dRows = Math.round((e.clientY - startY) / cellH);
@@ -2391,8 +2395,9 @@ export class EditMode {
 
   /** Convert a client point to absolute grid coordinates (half-grid snap). */
   _clientToGridCoords(clientX, clientY, containerRect) {
-    const px = clientX - containerRect.left;
-    const py = clientY - containerRect.top;
+    const zoom = this.board._zoomFactor || 1;
+    const px = (clientX - containerRect.left) / zoom;
+    const py = (clientY - containerRect.top) / zoom;
     const { x, y } = this.board.pixelToGrid(px, py);
     let gx = Math.round(x * 2) / 2;
     let gy = Math.round(y * 2) / 2;
@@ -2613,7 +2618,8 @@ export class EditMode {
     const x = clientX - containerRect.left;
     const y = clientY - containerRect.top;
     const cellW = containerRect.width / this.board.columns;
-    const cellH = this.board.rowHeight + this.board.gap;
+    const zoom = this.board._zoomFactor || 1;
+    const cellH = (this.board.rowHeight + this.board.gap) * zoom;
     return {
       col: Math.max(1, Math.floor(x / cellW) + 1),
       row: Math.max(1, Math.floor(y / cellH) + 1),
@@ -2733,6 +2739,97 @@ export class EditMode {
     parallaxVal.textContent = state.parallax.toFixed(2);
     parallaxRow.append(parallaxSlider, parallaxVal);
 
+    // ── Overlay effect: Stitch ──
+    state.effect = state.effect || 'none';
+    if (!state.stitch) state.stitch = { speed: 120, stitchLen: 10, palette: 'warm', style: 'running', curliness: 3 };
+
+    const effectRow = mkField('Effect');
+    const effectSel = document.createElement('select');
+    [['none', 'None'], ['stitch', 'Stitch'], ['stitch-wander', 'Stitch (wander)']].forEach(([val, lbl]) => {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = lbl;
+      if (state.effect === val) opt.selected = true;
+      effectSel.appendChild(opt);
+    });
+    effectRow.appendChild(effectSel);
+
+    // Stitch sub-controls container
+    const stitchGroup = document.createElement('div');
+    stitchGroup.classList.add('bg-modal-stitch-group');
+    modal.appendChild(stitchGroup);
+
+    // Stitch palette
+    const stitchPaletteRow = mkField('Palette');
+    stitchGroup.appendChild(stitchPaletteRow);
+    const stitchPaletteSel = document.createElement('select');
+    [['warm', 'Warm'], ['cool', 'Cool'], ['pastel', 'Pastel'], ['mono', 'Mono']].forEach(([val, lbl]) => {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = lbl;
+      if (state.stitch.palette === val) opt.selected = true;
+      stitchPaletteSel.appendChild(opt);
+    });
+    stitchPaletteRow.appendChild(stitchPaletteSel);
+
+    // Stitch style
+    const stitchStyleRow = mkField('Stitch style');
+    stitchGroup.appendChild(stitchStyleRow);
+    const stitchStyleSel = document.createElement('select');
+    [['running', 'Running'], ['backstitch', 'Backstitch'], ['zigzag', 'Zigzag'], ['chain', 'Chain'], ['mixed', 'Mixed']].forEach(([val, lbl]) => {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = lbl;
+      if (state.stitch.style === val) opt.selected = true;
+      stitchStyleSel.appendChild(opt);
+    });
+    stitchStyleRow.appendChild(stitchStyleSel);
+
+    // Stitch speed
+    const stitchSpeedRow = mkField('Speed');
+    stitchGroup.appendChild(stitchSpeedRow);
+    const stitchSpeedSlider = document.createElement('input');
+    stitchSpeedSlider.type = 'range';
+    stitchSpeedSlider.min = '20';
+    stitchSpeedSlider.max = '400';
+    stitchSpeedSlider.step = '10';
+    stitchSpeedSlider.value = state.stitch.speed;
+    stitchSpeedSlider.classList.add('bg-modal-range');
+    const stitchSpeedVal = document.createElement('span');
+    stitchSpeedVal.classList.add('bg-modal-range-val');
+    stitchSpeedVal.textContent = state.stitch.speed;
+    stitchSpeedRow.append(stitchSpeedSlider, stitchSpeedVal);
+
+    // Stitch length
+    const stitchLenRow = mkField('Stitch size');
+    stitchGroup.appendChild(stitchLenRow);
+    const stitchLenSlider = document.createElement('input');
+    stitchLenSlider.type = 'range';
+    stitchLenSlider.min = '3';
+    stitchLenSlider.max = '30';
+    stitchLenSlider.step = '1';
+    stitchLenSlider.value = state.stitch.stitchLen;
+    stitchLenSlider.classList.add('bg-modal-range');
+    const stitchLenVal = document.createElement('span');
+    stitchLenVal.classList.add('bg-modal-range-val');
+    stitchLenVal.textContent = state.stitch.stitchLen;
+    stitchLenRow.append(stitchLenSlider, stitchLenVal);
+
+    // Curliness
+    const curlinessRow = mkField('Curliness');
+    stitchGroup.appendChild(curlinessRow);
+    const curlinessSlider = document.createElement('input');
+    curlinessSlider.type = 'range';
+    curlinessSlider.min = '1';
+    curlinessSlider.max = '20';
+    curlinessSlider.step = '1';
+    curlinessSlider.value = state.stitch.curliness;
+    curlinessSlider.classList.add('bg-modal-range');
+    const curlinessVal = document.createElement('span');
+    curlinessVal.classList.add('bg-modal-range-val');
+    curlinessVal.textContent = state.stitch.curliness;
+    curlinessRow.append(curlinessSlider, curlinessVal);
+
     backdrop.appendChild(modal);
     document.body.appendChild(backdrop);
 
@@ -2746,10 +2843,12 @@ export class EditMode {
       presetRow.classList.toggle('is-hidden', t !== 'animated');
       // Parallax only makes sense for non-solid types
       parallaxRow.classList.toggle('is-hidden', t === 'solid');
+      // Stitch sub-controls only visible when effect is 'stitch'
+      stitchGroup.classList.toggle('is-hidden', !state.effect.startsWith('stitch'));
     };
 
     const apply = () => {
-      this.board.background = { ...state };
+      this.board.background = { ...state, stitch: { ...state.stitch } };
       this.board.applyBackground();
     };
 
@@ -2771,6 +2870,28 @@ export class EditMode {
     parallaxSlider.addEventListener('input', () => {
       state.parallax = parseFloat(parallaxSlider.value);
       parallaxVal.textContent = state.parallax.toFixed(2);
+      apply();
+    });
+    effectSel.addEventListener('change', () => {
+      state.effect = effectSel.value;
+      syncVisibility();
+      apply();
+    });
+    stitchPaletteSel.addEventListener('change', () => { state.stitch.palette = stitchPaletteSel.value; apply(); });
+    stitchStyleSel.addEventListener('change', () => { state.stitch.style = stitchStyleSel.value; apply(); });
+    stitchSpeedSlider.addEventListener('input', () => {
+      state.stitch.speed = parseInt(stitchSpeedSlider.value, 10);
+      stitchSpeedVal.textContent = state.stitch.speed;
+      apply();
+    });
+    stitchLenSlider.addEventListener('input', () => {
+      state.stitch.stitchLen = parseInt(stitchLenSlider.value, 10);
+      stitchLenVal.textContent = state.stitch.stitchLen;
+      apply();
+    });
+    curlinessSlider.addEventListener('input', () => {
+      state.stitch.curliness = parseInt(curlinessSlider.value, 10);
+      curlinessVal.textContent = state.stitch.curliness;
       apply();
     });
 

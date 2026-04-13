@@ -485,20 +485,20 @@
     {
       "id": "text-1775971627064-2",
       "type": "text",
-      "gridColumn": 26,
+      "gridColumn": 27,
       "gridRow": 10,
       "colSpan": 8,
       "rowSpan": 6,
       "content": {
-        "tag": "h2",
         "text": "New text",
         "frame": {
-          "x": 26,
-          "y": 25,
+          "x": 30,
+          "y": 32,
           "width": 48,
           "height": 48,
           "rotation": 82
-        }
+        },
+        "fontSize": 9
       },
       "style": {
         "borderWidth": 10,
@@ -524,6 +524,10 @@
             {
               "x": 0,
               "y": 6
+            },
+            {
+              "x": 0,
+              "y": 4.5
             }
           ],
           "smooth": false
@@ -536,7 +540,10 @@
         "exit": "none",
         "duration": 1.6,
         "trigger": 80,
-        "triggerRow": 13
+        "triggerRow": 13,
+        "entranceDuration": 1.6,
+        "exitDuration": 1.6,
+        "scrollDuration": 1.6
       }
     },
     {
@@ -713,7 +720,7 @@
       "id": "text-1776011681621-1",
       "type": "text",
       "gridColumn": 6,
-      "gridRow": 13,
+      "gridRow": 12,
       "colSpan": 9,
       "rowSpan": 4,
       "content": {
@@ -770,6 +777,37 @@
         "exitDuration": 0.6,
         "scrollDuration": 0.6
       }
+    },
+    {
+      "id": "text-1776043681927-1",
+      "type": "text",
+      "gridColumn": 25,
+      "gridRow": 6,
+      "colSpan": 5,
+      "rowSpan": 4,
+      "content": {
+        "fontSize": 9,
+        "text": "New text",
+        "frame": {
+          "x": -21,
+          "y": -103,
+          "width": 100,
+          "height": 100,
+          "rotation": 0
+        }
+      },
+      "style": {
+        "borderWidth": 10,
+        "borderColor": "#ffffff",
+        "opacity": 1
+      },
+      "layer": 1,
+      "animation": {
+        "enabled": false,
+        "entrance": "fadeInUp",
+        "exit": "none",
+        "scroll": "none"
+      }
     }
   ],
   "background": {
@@ -778,6 +816,14 @@
     "color2": "#5a3535",
     "angle": 249,
     "preset": "aurora",
-    "parallax": 1
+    "parallax": 1,
+    "effect": "stitch-wander",
+    "stitch": {
+      "speed": 120,
+      "stitchLen": 10,
+      "palette": "warm",
+      "style": "running",
+      "curliness": 3
+    }
   }
 }

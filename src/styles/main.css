@@ -22,6 +22,19 @@ body {
   padding: 2rem;
 }
 
+@media (max-width: 1024px) {
+  body {
+    padding: 0.5rem;
+  }
+}
+
+@media (max-width: 600px) {
+  body {
+    padding: 0;
+    overflow-x: hidden;
+  }
+}
+
 img {
   display: block;
   width: 100%;
@@ -36,10 +49,18 @@ img {
   top: 0;
   left: 0;
   width: 100%;
-  height: 200vh;
+  height: 100vh;
   z-index: -1;
   will-change: transform;
   pointer-events: none;
+}
+
+.pg-bg-stitch {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 
 /* ── Pegboard Grid ── */
@@ -462,11 +483,10 @@ img {
   cursor: nwse-resize;
 }
 
-/* Selected element — !important overrides the inline outline set by applyDesign (panel border).
-   z-index lifts it above neighboring panels so the outline isn't hidden. */
+/* Selected element — uses box-shadow so it doesn't hide the panel's own
+   outline border.  z-index lifts it above neighboring panels. */
 .edit-element.is-selected {
-  outline: 2px solid rgba(100, 140, 255, 0.7) !important;
-  outline-offset: 0px !important;
+  box-shadow: 0 0 0 2px rgba(100, 140, 255, 0.7) !important;
   z-index: 11 !important;
 }
 
@@ -475,15 +495,16 @@ img {
   cursor: grab;
 }
 
-/* Suppress outline on shaped elements — the bounds overlay replaces it */
+/* Suppress selection ring on shaped elements — the bounds overlay replaces it.
+   clip-path clips box-shadow, so it must be removed entirely. */
 .edit-element.is-selected.has-shape-bounds {
-  outline: none !important;
+  box-shadow: none !important;
 }
 
-/* Lines: wrapper spans the whole grid, so the default outline would be
+/* Lines: wrapper spans the whole grid, so the selection ring would be
    huge and misleading. Rely on the anchor handles for selection feedback. */
 .edit-element.is-selected[data-type="line"] {
-  outline: none;
+  box-shadow: none !important;
 }
 
 /* Bounds overlay — transparent grid-sized container that hosts the
@@ -569,7 +590,7 @@ img {
   position: fixed;
   top: 0;
   right: 0;
-  width: 280px;
+  width: min(280px, 75vw);
   height: 100vh;
   background: rgba(18, 18, 18, 0.97);
   backdrop-filter: blur(12px);
@@ -1135,6 +1156,7 @@ input[type="checkbox"] {
 }
 
 .bg-modal-field.is-hidden { display: none; }
+.bg-modal-stitch-group.is-hidden { display: none; }
 
 .bg-modal-range {
   flex: 1;

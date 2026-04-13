@@ -2,6 +2,7 @@ import { createTextBlock } from '../elements/TextBlock.js';
 import { createImageBlock } from '../elements/ImageBlock.js';
 import { createSplitBlock } from '../elements/SplitBlock.js';
 import { createLineBlock } from '../elements/LineBlock.js';
+import { createStitchEffect, createWanderStitchEffect } from '../effects/StitchEffect.js';
 
 const elementFactories = {
   text: createTextBlock,
@@ -63,6 +64,7 @@ export class PegBoard {
     this._animObserver = null;
     this._animObservedIds = new Set();
     this.editModeActive = false;
+    this._zoomFactor = 1;
 
     this.setup();
   }
@@ -72,6 +74,12 @@ export class PegBoard {
     this.container.style.setProperty('--pg-columns', this.columns);
     this.container.style.setProperty('--pg-gap', `${this.gap}px`);
     this._gridRO.observe(this.container);
+    // Window resize catches cases where the container has a fixed width (zoom mode)
+    // and the ResizeObserver won't fire when the viewport grows.
+    if (!this._onWindowResize) {
+      this._onWindowResize = () => this._syncRowHeight();
+      window.addEventListener('resize', this._onWindowResize);
+    }
     this._syncRowHeight();
 
     // Background layer (fixed div behind content)
@@ -85,14 +93,35 @@ export class PegBoard {
   }
 
   _syncRowHeight() {
-    const w = this.container.clientWidth;
-    if (w === 0) return;
-    const colWidth = (w - (this.columns - 1) * this.gap) / this.columns;
-    this.rowHeight = Math.round(colWidth);
+    // Use parent's content width to avoid feedback loops when zoom is applied
+    const parent = this.container.parentElement;
+    const available = parent ? parent.clientWidth - parseFloat(getComputedStyle(parent).paddingLeft) - parseFloat(getComputedStyle(parent).paddingRight) : window.innerWidth;
+    if (available === 0) return;
+
+    const minCellSize = 18; // minimum usable cell size in px
+    const naturalCell = (available - (this.columns - 1) * this.gap) / this.columns;
+
+    if (naturalCell < minCellSize) {
+      // Force grid to a design width where cells are usable, then zoom to fit
+      const designWidth = this.columns * minCellSize + (this.columns - 1) * this.gap;
+      const zoomFactor = available / designWidth;
+      this.container.style.width = `${designWidth}px`;
+      this.container.style.zoom = zoomFactor;
+      this.rowHeight = minCellSize;
+      this._zoomFactor = zoomFactor;
+    } else {
+      this.container.style.width = '';
+      this.container.style.zoom = '';
+      this.rowHeight = Math.round(naturalCell);
+      this._zoomFactor = 1;
+    }
+
     this.container.style.setProperty('--pg-row-height', `${this.rowHeight}px`);
   }
 
-  /** Column width in pixels (matches CSS grid layout — gap-aware). */
+  /** Column width in pixels (matches CSS grid layout — gap-aware).
+   *  When zoom is active, clientWidth reports the unzoomed (design) width,
+   *  which is exactly what grid coord math needs. */
   _cellWidth() {
     const w = this.container.clientWidth;
     if (w === 0) return 0;
@@ -297,19 +326,10 @@ export class PegBoard {
     // Build the path — rounded corners when smooth is on
     const radius = shape.smooth ? (s.borderRadius ?? 8) : 0;
 
-    // Straddle the anchor edge: clip to an outset polygon (bw/2 outward) so
-    // the border's outer half extends past the anchor line. The inner ring
-    // edge is inset bw/2 inward. Total ring thickness = bw, centered on the
-    // original anchor polygon — matching how rectangle borders now straddle
-    // their grid-cell edge and aligning with lines at the same coord.
+    // Clip to the original anchor polygon (no outset). The border ring
+    // sits fully inside this clip so containment can't cut it off.
     const bw = s.borderShow !== false ? (s.borderWidth ?? 1) : 0;
-    const half = bw / 2;
-    const outerPts = half > 0 ? this._insetPolygon(pts, -half) : pts;
-    const outerPathD = this._roundedPolygonPath(
-      outerPts.length >= 3 ? outerPts : pts,
-      radius,
-    );
-    const clipPathD = outerPathD;
+    const clipPathD = this._roundedPolygonPath(pts, radius);
 
     // Clip shape (userSpaceOnUse with pixel coords)
     const clipId = `shape-${config.id}`;
@@ -334,11 +354,12 @@ export class PegBoard {
     wrapper.style.clipPath = `url(#${clipId})`;
     wrapper.style.borderRadius = '0';
 
-    // Border overlay — filled ring between outset outer and inset inner
-    if (s.borderShow !== false) {
+    // Border overlay — filled ring fully inside the clip.
+    // Outer edge = anchor polygon, inner edge = inset by full bw.
+    if (s.borderShow !== false && bw > 0) {
       const bc = s.borderColor || '#1e1e1e';
 
-      const innerInsetPts = this._insetPolygon(pts, half);
+      const innerInsetPts = this._insetPolygon(pts, bw);
       const innerPathD = innerInsetPts.length >= 3
         ? this._roundedPolygonPath(innerInsetPts, radius)
         : '';
@@ -348,8 +369,8 @@ export class PegBoard {
       borderSvg.setAttribute('viewBox', `0 0 ${w} ${h}`);
 
       const borderPath = document.createElementNS(ns, 'path');
-      // Outer CW + inner CCW via reversed inner path → evenodd fills the ring
-      borderPath.setAttribute('d', outerPathD + ' ' + this._reversePath(innerPathD));
+      // Outer CW (anchor polygon) + inner CCW → evenodd fills the ring
+      borderPath.setAttribute('d', clipPathD + ' ' + this._reversePath(innerPathD));
       borderPath.setAttribute('fill', bc);
       borderPath.setAttribute('fill-rule', 'evenodd');
       borderSvg.appendChild(borderPath);
@@ -423,19 +444,18 @@ export class PegBoard {
     const h = wrapper.offsetHeight;
     if (w === 0 || h === 0) return;
 
-    // Straddle the wrapper edge: expand the clip ellipse outward by bw/2 so
-    // the outer half of the border stroke isn't clipped.
-    const bwc = s.borderShow !== false ? (s.borderWidth ?? 1) : 0;
-    const halfc = bwc / 2;
-    wrapper.style.clipPath = halfc > 0
-      ? `ellipse(${w / 2 + halfc}px ${h / 2 + halfc}px at 50% 50%)`
-      : 'ellipse(50% 50% at 50% 50%)';
+    // Clip to a standard ellipse at the wrapper edge — no outset needed
+    // because the border is fully inset.
+    wrapper.style.clipPath = 'ellipse(50% 50% at 50% 50%)';
     wrapper.style.borderRadius = '0';
 
-    // Border overlay — ellipse ring centered on the wrapper edge
-    if (s.borderShow !== false) {
+    // Border overlay — ellipse ring fully inside the clip.
+    // Outer stroke edge aligns with clip edge; inner edge is bw inward.
+    const bwc = s.borderShow !== false ? (s.borderWidth ?? 1) : 0;
+    if (s.borderShow !== false && bwc > 0) {
       const bc = s.borderColor || '#1e1e1e';
       const ns = 'http://www.w3.org/2000/svg';
+      const halfc = bwc / 2;
 
       const borderSvg = document.createElementNS(ns, 'svg');
       borderSvg.classList.add('shape-border-overlay');
@@ -444,8 +464,9 @@ export class PegBoard {
       const ellipse = document.createElementNS(ns, 'ellipse');
       ellipse.setAttribute('cx', w / 2);
       ellipse.setAttribute('cy', h / 2);
-      ellipse.setAttribute('rx', w / 2);
-      ellipse.setAttribute('ry', h / 2);
+      // Inset radii by half the stroke so outer edge sits at w/2, h/2
+      ellipse.setAttribute('rx', w / 2 - halfc);
+      ellipse.setAttribute('ry', h / 2 - halfc);
       ellipse.setAttribute('fill', 'none');
       ellipse.setAttribute('stroke', bc);
       ellipse.setAttribute('stroke-width', bwc);
@@ -731,6 +752,7 @@ export class PegBoard {
   /**
    * Apply the background config to the #pg-bg layer.
    * Supports: solid, gradient (linear), animated (flow / aurora presets).
+   * Overlay effects (e.g. stitch) are layered on top.
    */
   applyBackground() {
     const el = this._bgEl;
@@ -742,7 +764,11 @@ export class PegBoard {
     el.style.backgroundColor = '';
 
     const bg = this.background;
-    if (!bg) { this._applyParallaxScroll(); return; }
+    if (!bg) {
+      this._destroyStitchEffect();
+      this._applyParallaxScroll();
+      return;
+    }
 
     const color1 = bg.color1 || '#0a0a0a';
     const color2 = bg.color2 || '#1a1a3a';
@@ -761,7 +787,53 @@ export class PegBoard {
         : 'bg-flow 20s ease-in-out infinite';
     }
 
+    // Overlay effects
+    this._applyStitchEffect(bg);
+
     this._applyParallaxScroll();
+  }
+
+  /** Create or destroy the stitch canvas overlay based on background config. */
+  _applyStitchEffect(bg) {
+    const isStitch = bg.effect === 'stitch' || bg.effect === 'stitch-wander';
+    if (isStitch) {
+      const s = bg.stitch || {};
+      const wantWander = bg.effect === 'stitch-wander';
+
+      // If the variant changed, destroy and recreate
+      if (this._stitchCtrl && this._stitchVariant !== bg.effect) {
+        this._destroyStitchEffect();
+      }
+
+      if (this._stitchCtrl) {
+        // Update existing instance
+        this._stitchCtrl.setSpeed(s.speed ?? 120);
+        this._stitchCtrl.setStitchLen(s.stitchLen ?? 10);
+        this._stitchCtrl.setPalette(s.palette ?? 'warm');
+        this._stitchCtrl.setStyle(s.style ?? 'running');
+        this._stitchCtrl.setCurliness(s.curliness ?? 3);
+      } else {
+        const factory = wantWander ? createWanderStitchEffect : createStitchEffect;
+        this._stitchCtrl = factory(this._bgEl, {
+          speed:     s.speed ?? 120,
+          stitchLen: s.stitchLen ?? 10,
+          palette:   s.palette ?? 'warm',
+          style:     s.style ?? 'running',
+          curliness: s.curliness ?? (wantWander ? 5 : 3),
+          customColors: s.customColors || null,
+        });
+        this._stitchVariant = bg.effect;
+      }
+    } else {
+      this._destroyStitchEffect();
+    }
+  }
+
+  _destroyStitchEffect() {
+    if (this._stitchCtrl) {
+      this._stitchCtrl.destroy();
+      this._stitchCtrl = null;
+    }
   }
 
   // ── Scroll animations ──
@@ -807,8 +879,10 @@ export class PegBoard {
       const containerTop = this.container.getBoundingClientRect().top + window.scrollY;
       const viewportBottom = window.scrollY + window.innerHeight;
       const scrollIntoGrid = viewportBottom - containerTop;
-      // Convert to grid row number (1-based)
-      const rowH = this.rowHeight + this.gap;
+      // Convert to grid row number (1-based). Multiply by zoom since
+      // scrollIntoGrid is in visual space but rowHeight is unzoomed.
+      const zoom = this._zoomFactor || 1;
+      const rowH = (this.rowHeight + this.gap) * zoom;
       const revealedRow = rowH > 0 ? Math.floor(scrollIntoGrid / rowH) + 1 : 999;
 
       for (const entry of animated) {
@@ -928,7 +1002,7 @@ export class PegBoard {
   _applyParallaxScroll() {
     // Disable parallax in edit mode so panels stay aligned with the grid
     if (this.editModeActive) {
-      if (this._bgEl) this._bgEl.style.transform = '';
+      if (this._bgEl) { this._bgEl.style.transform = ''; this._bgEl.style.height = ''; }
       this.elements.forEach(({ wrapper }) => { wrapper.style.translate = ''; });
       if (this.onParallaxUpdate) this.onParallaxUpdate();
       return;
@@ -940,9 +1014,14 @@ export class PegBoard {
     if (this._bgEl) {
       if (bgDepth === 0) {
         this._bgEl.style.transform = '';
+        this._bgEl.style.height = '';
       } else {
         const y = window.scrollY * bgDepth * -0.5;
         this._bgEl.style.transform = `translateY(${y}px)`;
+        // Size bg tall enough so the bottom never lifts above the viewport
+        const maxScroll = document.documentElement.scrollHeight - window.innerHeight;
+        const maxShift = maxScroll * bgDepth * 0.5;
+        this._bgEl.style.height = `calc(100vh + ${maxShift}px)`;
       }
     }
 
