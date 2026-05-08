@@ -1,0 +1,16 @@
+{
+  "grid": {
+    "columns": 96,
+    "rowHeight": 19,
+    "gap": 0
+  },
+  "elements": [],
+  "background": {
+    "type": "solid",
+    "colors": [
+      "#1a1a1a"
+    ],
+    "parallax": 0,
+    "effect": "none"
+  }
+}

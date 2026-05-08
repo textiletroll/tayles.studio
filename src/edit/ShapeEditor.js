@@ -67,7 +67,7 @@ export class ShapeEditor {
     if (!config.style.shape || !config.style.shape.anchors || config.style.shape.anchors.length < 3) {
       const wasCircle = config.style.shape?.preset === 'circle';
       if (wasCircle) {
-        // Convert circle to 4-point diamond with smooth curves
+        // Convert circle to 4-point diamond with full curve
         config.style.shape = {
           anchors: [
             { x: colSpan / 2, y: 0 },
@@ -75,7 +75,7 @@ export class ShapeEditor {
             { x: colSpan / 2, y: rowSpan },
             { x: 0, y: rowSpan / 2 },
           ],
-          smooth: true,
+          edge: 'curve',
         };
       } else {
         config.style.shape = {
@@ -85,7 +85,7 @@ export class ShapeEditor {
             { x: colSpan, y: rowSpan },
             { x: 0, y: rowSpan },
           ],
-          smooth: false,
+          edge: 'sharp',
         };
       }
     }
@@ -158,15 +158,30 @@ export class ShapeEditor {
         section.appendChild(this.editMode._peReadonly('Type', preset.charAt(0).toUpperCase() + preset.slice(1)));
       }
 
-      // Smooth toggle
-      const smoothCheck = document.createElement('input');
-      smoothCheck.type = 'checkbox';
-      smoothCheck.checked = !!shape.smooth;
-      smoothCheck.addEventListener('change', () => {
-        shape.smooth = smoothCheck.checked;
+      // Edge mode — three modes:
+      //   sharp:   anchor-to-anchor straight edges (no rounding)
+      //   rounded: straight edges + corners rounded by borderRadius
+      //   curve:   Chaikin curve through every anchor
+      // Legacy `shape.smooth: true` resolves to 'curve' until the user
+      // explicitly picks an edge mode (then we drop the legacy field).
+      const edgeMode = shape.edge
+        || (shape.smooth ? 'curve' : 'sharp');
+      const edgeSel = document.createElement('select');
+      edgeSel.classList.add('pe-input');
+      [['sharp', 'Sharp'], ['rounded', 'Rounded corners'], ['curve', 'Curve']].forEach(([val, lbl]) => {
+        const opt = document.createElement('option');
+        opt.value = val;
+        opt.textContent = lbl;
+        if (val === edgeMode) opt.selected = true;
+        edgeSel.appendChild(opt);
+      });
+      edgeSel.addEventListener('change', () => {
+        shape.edge = edgeSel.value;
+        // Clean up the legacy field — `edge` is now authoritative.
+        delete shape.smooth;
         applyDesign();
       });
-      section.appendChild(this.editMode._peField('Smooth', smoothCheck));
+      section.appendChild(this.editMode._peField('Edge', edgeSel));
 
       // Anchor count
       section.appendChild(this.editMode._peReadonly('Anchors', `${shape.anchors.length}`));
@@ -304,7 +319,7 @@ export class ShapeEditor {
           { x: colSpan, y: rowSpan },
           { x: 0, y: rowSpan },
         ],
-        smooth: false,
+        edge: 'sharp',
       };
     }
     // Default rectangle

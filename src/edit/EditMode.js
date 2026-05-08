@@ -1,12 +1,24 @@
 /**
  * EditMode — toggles editing on a PegBoard instance.
  * Only available when the page is loaded with ?edit in the URL.
- * Saves layout back to src/data/layout.json via dev server on exit.
+ * Saves layout back to src/data/layouts/<slug>.json via dev server on exit.
  */
 
 import { ShapeEditor } from './ShapeEditor.js';
 import { applySplitBoundary } from '../elements/SplitBlock.js';
 import { computeShapeBBox } from '../grid/PegBoard.js';
+import { STITCH_PALETTES } from '../effects/StitchEffect.js';
+import { applyContentFrame, ensureFontLoaded } from '../elements/Viewport.js';
+import pagesIndex from '../data/pages.json';
+
+/** Curated Google Fonts list shown in the per-content-block font picker. */
+const FONT_LIST = [
+  'Inter', 'Roboto', 'Open Sans', 'Lato', 'Montserrat', 'Poppins',
+  'Playfair Display', 'Merriweather', 'Lora', 'EB Garamond', 'Cormorant Garamond',
+  'Bebas Neue', 'Oswald', 'Anton', 'Raleway',
+  'Caveat', 'Pacifico', 'Dancing Script', 'Permanent Marker',
+  'Source Code Pro', 'JetBrains Mono', 'Fira Code',
+];
 
 let _idCounter = 0;
 function uniqueId(prefix) {
@@ -14,14 +26,23 @@ function uniqueId(prefix) {
 }
 
 export class EditMode {
-  constructor(board) {
+  constructor(board, options = {}) {
     this.board = board;
+    /* Slug of the page this editor instance is bound to. Used as the
+       target file when saving (POST /api/save-layout?slug=<slug>) and
+       to highlight the active entry in the Pages dropdown. */
+    this.pageSlug = options.slug || 'home';
     this.active = false;
     this.dragging = null;
     this.resizing = null;
     this._contextMenu = null;
     this._selectedId = null;
-    this._panelEditorVisible = false;
+    this._selectedContentIdx = null;
+    /* Sidebar pin state — when true, sidebar stays visible with empty
+       prompt even when nothing is selected (toggled via View → Panel Editor).
+       When false (default), sidebar auto-shows on selection and auto-hides
+       on deselection. */
+    this._panelEditorPinned = false;
     this._panelEditorEl = null;
 
     this._onPointerMove = this._onPointerMove.bind(this);
@@ -37,6 +58,10 @@ export class EditMode {
     if (new URLSearchParams(window.location.search).has('edit')) {
       this._buildUI();
       this._buildPanelEditor();
+      // Auto-enable so HMR reloads (triggered by writing to layout.json from
+      // any save flow — Save button, Exit Edit, bg modal close) don't kick the
+      // user out of edit mode and force them to re-click Edit.
+      this.enable();
     }
   }
 
@@ -50,9 +75,13 @@ export class EditMode {
     this.active = true;
     this.board.editModeActive = true;
     this.board._applyParallaxScroll();  // clear parallax translations for grid alignment
+    this.board._applyAllLockedStates(); // unpin locked panels back into the grid
     this.board.setupScrollAnimations(); // disables animations, makes all visible
     this.board.container.classList.add('edit-mode');
-    this.toggleBtn.textContent = 'Exit Edit';
+    document.body.classList.add('is-editing');
+    this.toggleBtn.textContent = 'Exit edit';
+    this.toggleBtn.classList.add('is-active');
+    this._syncSidebar();
     this._attachElementHandlers();
     this._buildGridOverlay();
     this.board.container.addEventListener('contextmenu', this._onContextMenu);
@@ -79,8 +108,12 @@ export class EditMode {
     this.active = false;
     this.board.editModeActive = false;
     this.board._applyParallaxScroll();  // restore parallax translations
+    requestAnimationFrame(() => this.board._applyAllLockedStates()); // re-pin after grid settles
     this.board.container.classList.remove('edit-mode', 'alt-active');
+    document.body.classList.remove('is-editing');
     this.toggleBtn.textContent = 'Edit';
+    this.toggleBtn.classList.remove('is-active');
+    this._syncSidebar();
     this._detachElementHandlers();
     this._removeGridOverlay();
     this._dismissMenu();
@@ -104,12 +137,28 @@ export class EditMode {
   // ── UI chrome ──
 
   _buildUI() {
+    // Lazy-load chrome fonts — only editing users pay for them. Public site
+    // visitors never see editor chrome, so they never trigger this.
+    if (!document.getElementById('ed-chrome-fonts')) {
+      const link = document.createElement('link');
+      link.id = 'ed-chrome-fonts';
+      link.rel = 'stylesheet';
+      link.href = 'https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap';
+      document.head.appendChild(link);
+    }
+
     const bar = document.createElement('div');
     bar.classList.add('edit-bar');
 
+    // Wordmark — sets the "atelier console" tone; no pointer events.
+    const wordmark = document.createElement('div');
+    wordmark.classList.add('edit-wordmark');
+    wordmark.innerHTML = '<span class="edit-wordmark-dot"></span>tayles<span class="edit-wordmark-sep">·</span><em>editor</em>';
+    bar.appendChild(wordmark);
+
     this.toggleBtn = document.createElement('button');
     this.toggleBtn.textContent = 'Edit';
-    this.toggleBtn.classList.add('edit-btn');
+    this.toggleBtn.classList.add('edit-btn', 'edit-btn--primary');
     this.toggleBtn.addEventListener('click', () => this.toggle());
 
     this.saveBtn = document.createElement('button');
@@ -117,12 +166,18 @@ export class EditMode {
     this.saveBtn.classList.add('edit-btn');
     this.saveBtn.addEventListener('click', () => this._saveLayout());
 
+    const pagesWrap = this._buildPagesMenu();
+
+    // Spacer pushes the View dropdown to the right edge of the bar.
+    const spacer = document.createElement('div');
+    spacer.classList.add('edit-bar-spacer');
+
     // View dropdown
     const viewWrap = document.createElement('div');
     viewWrap.classList.add('edit-dropdown');
 
     const viewBtn = document.createElement('button');
-    viewBtn.textContent = 'View';
+    viewBtn.innerHTML = 'View<span class="edit-btn-caret">▾</span>';
     viewBtn.classList.add('edit-btn');
     viewWrap.appendChild(viewBtn);
 
@@ -135,15 +190,15 @@ export class EditMode {
     this._peCheckbox.type = 'checkbox';
     this._peCheckbox.checked = false;
     this._peCheckbox.addEventListener('change', () => {
-      this._panelEditorVisible = this._peCheckbox.checked;
-      this._togglePanelEditor();
+      this._panelEditorPinned = this._peCheckbox.checked;
+      this._syncSidebar();
     });
     panelEditorItem.append(this._peCheckbox, ' Panel Editor');
     viewMenu.appendChild(panelEditorItem);
 
     viewWrap.appendChild(viewMenu);
 
-    bar.append(this.toggleBtn, this.saveBtn, viewWrap);
+    bar.append(this.toggleBtn, this.saveBtn, pagesWrap, spacer, viewWrap);
     document.body.prepend(bar);
   }
 
@@ -157,27 +212,35 @@ export class EditMode {
     document.body.appendChild(sidebar);
   }
 
-  _togglePanelEditor() {
-    this._panelEditorEl.classList.toggle('panel-editor-open', this._panelEditorVisible);
-    if (this._peCheckbox) this._peCheckbox.checked = this._panelEditorVisible;
+  /** Compute sidebar visibility from current state and apply it. Open iff
+   *  edit mode is active AND (something is selected OR the user pinned it
+   *  open via the View → Panel Editor checkbox). */
+  _syncSidebar() {
+    if (!this._panelEditorEl) return;
+    const open = this.active
+      && (this._panelEditorPinned || this._selectedId != null);
+    this._panelEditorEl.classList.toggle('panel-editor-open', open);
+    if (this._peCheckbox) this._peCheckbox.checked = this._panelEditorPinned;
   }
 
-  _selectElement(id) {
-    // Deselect previous
-    if (this._selectedId) {
+  _selectElement(id, contentIdx = null) {
+    // Clear previous content-selected class on any node
+    if (this._selectedId != null) {
       const prev = this.board.elements.get(this._selectedId);
       if (prev) {
         prev.wrapper.classList.remove('is-selected');
         prev.wrapper.classList.remove('has-shape-bounds');
+        prev.wrapper.querySelectorAll('.viewport-content.is-content-selected')
+          .forEach(n => n.classList.remove('is-content-selected'));
       }
     }
     this._removeBoundsOverlay();
     this._removeLineAnchors();
-    if (this._frameEditId && this._frameEditId !== id) {
-      this._exitFrameEdit();
-    }
+    // Always tear down frame overlay on selection change; re-show below if needed
+    this._exitFrameEdit();
 
     this._selectedId = id;
+    this._selectedContentIdx = (id && contentIdx != null) ? contentIdx : null;
 
     if (id) {
       const entry = this.board.elements.get(id);
@@ -185,15 +248,41 @@ export class EditMode {
         entry.wrapper.classList.add('is-selected');
         if (entry.config.type === 'line') {
           this._renderLineAnchors(id);
-        } else if (entry.config.style?.shape) {
-          // For shaped elements, create a bounds overlay outside the clip-path
+        } else if (entry.config.style?.shape && this._selectedContentIdx == null) {
+          // For shaped elements, create a bounds overlay outside the clip-path.
+          // Skip when a content block is selected — its frame overlay owns the UI.
           this._createBoundsOverlay(id);
+        }
+
+        // Content-block selection: highlight the chosen content node and show
+        // its frame handles for direct drag/resize/rotate.
+        if (this._selectedContentIdx != null) {
+          const node = this._findContentNode(id, this._selectedContentIdx);
+          if (node) node.classList.add('is-content-selected');
+          this._showFrameHandles(id, this._selectedContentIdx);
         }
       }
     }
 
     this._shapeEditor.onSelectionChange(id);
     this._populatePanelEditor();
+  }
+
+  /** Find the .viewport-content child for a given panel id + content index. */
+  _findContentNode(id, idx) {
+    const entry = this.board.elements.get(id);
+    if (!entry || !entry.element) return null;
+    return entry.element.querySelector(`.viewport-content[data-content-idx="${idx}"]`);
+  }
+
+  /** Rebuild a panel and re-apply the content-selected class on the new node
+   *  so live edits don't visually drop the selection on every keystroke. */
+  _rebuildKeepContent(id) {
+    this.board.rebuildElement(id);
+    if (this._selectedId === id && this._selectedContentIdx != null) {
+      const node = this._findContentNode(id, this._selectedContentIdx);
+      if (node) node.classList.add('is-content-selected');
+    }
   }
 
   // ── Bounds overlay for shaped elements ──
@@ -322,25 +411,40 @@ export class EditMode {
 
     if (!this._selectedId) {
       body.innerHTML = '<div class="panel-editor-empty">Select a panel to edit</div>';
+      this._syncSidebar();
       return;
     }
 
     const entry = this.board.elements.get(this._selectedId);
     if (!entry) {
       body.innerHTML = '<div class="panel-editor-empty">Panel not found</div>';
+      this._syncSidebar();
       return;
     }
 
     const { config } = entry;
 
+    // ── Content-block selection: render only the selected block's settings ──
+    if (this._selectedContentIdx != null && config.type === 'viewport') {
+      this._renderContentEditor(body, config, this._selectedContentIdx);
+      this._syncSidebar();
+      return;
+    }
+
     // Header — type dropdown + id
     const header = document.createElement('div');
     header.classList.add('pe-header');
 
-    if (config.type === 'line') {
+    if (config.type === 'line' || config.type === 'viewport' || config.type === 'picture' || config.type === 'iframe') {
       const typeLabel = document.createElement('div');
       typeLabel.classList.add('pe-type-readonly');
-      typeLabel.textContent = 'Line';
+      typeLabel.textContent = config.type === 'line'
+        ? 'Line'
+        : config.type === 'picture'
+          ? 'Image'
+          : config.type === 'iframe'
+            ? 'Iframe'
+            : 'Viewport';
       header.appendChild(typeLabel);
     } else {
       const typeSelect = document.createElement('select');
@@ -366,6 +470,12 @@ export class EditMode {
 
     if (config.type === 'line') {
       body.appendChild(this._buildLineEditor(config));
+    } else if (config.type === 'picture') {
+      // Pictures: image-specific controls only (no border / shape / bg).
+      body.appendChild(this._buildPictureEditor(config));
+    } else if (config.type === 'iframe') {
+      // Iframes: src + minimal style controls (no border-stitch / shape / texture).
+      body.appendChild(this._buildIframeEditor(config));
     } else {
       // Type-specific controls first (the important stuff)
       if (config.type === 'text') {
@@ -374,6 +484,8 @@ export class EditMode {
         body.appendChild(this._buildImageEditor(config));
       } else if (config.type === 'split') {
         body.appendChild(this._buildSplitEditor(config));
+      } else if (config.type === 'viewport') {
+        body.appendChild(this._buildViewportContentList(config));
       }
 
       // Design section
@@ -382,6 +494,16 @@ export class EditMode {
       // Shape section
       body.appendChild(this._shapeEditor.buildShapeSection(config));
     }
+
+    // Border effect section — skip for pictures and iframes (no peg-border)
+    if (config.type !== 'picture' && config.type !== 'iframe') {
+      body.appendChild(this._buildBorderStitchSection(config));
+    }
+
+    // Spawn section — controls when the element first appears. Decoupled from
+    // Animation so it works for elements with no entrance animation (lines,
+    // plain panels). Applies to all types.
+    body.appendChild(this._buildSpawnSection(config));
 
     // Animation section (all element types)
     body.appendChild(this._buildAnimationEditor(config));
@@ -396,13 +518,21 @@ export class EditMode {
       this.board.setLayer(config.id, v);
     });
     posSection.appendChild(this._peField('Layer', layerInput));
+
+    // Locked — element stays glued to the viewport regardless of scroll
+    const lockedCheck = document.createElement('input');
+    lockedCheck.type = 'checkbox';
+    lockedCheck.checked = !!config.locked;
+    lockedCheck.addEventListener('change', () => {
+      config.locked = lockedCheck.checked;
+      this.board._applyParallaxScroll();
+      this.board._applyAllLockedStates();
+    });
+    posSection.appendChild(this._peField('Locked', lockedCheck));
+
     body.appendChild(posSection);
 
-    // Auto-open sidebar if not visible
-    if (!this._panelEditorVisible) {
-      this._panelEditorVisible = true;
-      this._togglePanelEditor();
-    }
+    this._syncSidebar();
   }
 
   // ── Rich text toolbar ──
@@ -625,6 +755,182 @@ export class EditMode {
     return section;
   }
 
+  /* Picture editor — free-floating image element. No border / shape / bg.
+     Source replace via file picker (uploads + content-hashes), alt, fit,
+     opacity, and rotation. Hover-lift toggle as well since drop-shadow
+     follows the PNG alpha. */
+  _buildPictureEditor(config) {
+    const section = this._peSection('Image', true);
+    const content = config.content || (config.content = {});
+    const style = config.style || (config.style = {});
+
+    // Preview thumbnail
+    const preview = document.createElement('div');
+    preview.style.cssText = 'width:100%;height:80px;background:#0008;border:1px solid var(--ed-border, #2a2a2a);display:flex;align-items:center;justify-content:center;margin-bottom:0.5rem;border-radius:4px;overflow:hidden;';
+    const previewImg = document.createElement('img');
+    previewImg.src = content.src || '/placeholder.svg';
+    previewImg.style.cssText = 'max-width:100%;max-height:100%;object-fit:contain;';
+    preview.appendChild(previewImg);
+    section.appendChild(preview);
+
+    // Replace button — pops file picker, uploads, swaps src in place
+    const replaceBtn = document.createElement('button');
+    replaceBtn.classList.add('pe-input');
+    replaceBtn.textContent = 'Replace image…';
+    replaceBtn.style.cursor = 'pointer';
+    replaceBtn.style.marginBottom = '0.35rem';
+    replaceBtn.addEventListener('click', () => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/png,image/jpeg,image/webp,image/gif,image/svg+xml';
+      input.style.display = 'none';
+      document.body.appendChild(input);
+      input.addEventListener('change', async () => {
+        const file = input.files && input.files[0];
+        input.remove();
+        if (!file) return;
+        try {
+          const dataUrl = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(file);
+          });
+          const res = await fetch('/api/upload-image', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dataUrl, mime: file.type }),
+          });
+          const data = await res.json();
+          if (!data.ok) {
+            this._flash(`Upload failed: ${data.error || 'unknown'}`);
+            return;
+          }
+          content.src = data.path;
+          previewImg.src = data.path;
+          this._rebuildSelected();
+        } catch (err) {
+          this._flash(`Upload failed: ${err.message || err}`);
+        }
+      });
+      input.click();
+    });
+    section.appendChild(replaceBtn);
+
+    // Alt text
+    const altInput = document.createElement('input');
+    altInput.type = 'text';
+    altInput.classList.add('pe-input');
+    altInput.value = content.alt || '';
+    altInput.addEventListener('input', () => {
+      content.alt = altInput.value;
+      this._rebuildSelected();
+    });
+    section.appendChild(this._peField('Alt', altInput));
+
+    // Fit mode
+    const fitSel = document.createElement('select');
+    fitSel.classList.add('pe-input');
+    [['contain', 'Contain (fit inside)'], ['cover', 'Cover (fill, crop)'], ['fill', 'Fill (stretch)']].forEach(([v, l]) => {
+      const o = document.createElement('option');
+      o.value = v; o.textContent = l;
+      if ((content.fit || 'contain') === v) o.selected = true;
+      fitSel.appendChild(o);
+    });
+    fitSel.addEventListener('change', () => {
+      content.fit = fitSel.value;
+      this.board.applyDesign(config.id);
+    });
+    section.appendChild(this._peField('Fit', fitSel));
+
+    // Opacity (0..1)
+    const opacityInput = this._peNumberInput(style.opacity ?? 1, 0, 1, 0.05, (v) => {
+      style.opacity = v;
+      this.board.applyDesign(config.id);
+    });
+    section.appendChild(this._peField('Opacity', opacityInput));
+
+    // Rotation (-180..180 deg)
+    const rotInput = this._peNumberInput(style.rotation ?? 0, -180, 180, 1, (v) => {
+      style.rotation = v;
+      this.board.applyDesign(config.id);
+    });
+    section.appendChild(this._peField('Rotation°', rotInput));
+
+    // Hover lift (drop-shadow on hover, follows PNG alpha)
+    const liftCheck = document.createElement('input');
+    liftCheck.type = 'checkbox';
+    liftCheck.checked = style.hoverLift !== false ? !!style.hoverLift : false;
+    // Default off for pictures (decorative); the !== false default applies to panels.
+    if (style.hoverLift === undefined) {
+      style.hoverLift = false;
+      liftCheck.checked = false;
+    }
+    liftCheck.addEventListener('change', () => {
+      style.hoverLift = liftCheck.checked;
+      this.board.applyDesign(config.id);
+    });
+    section.appendChild(this._peField('Hover lift', liftCheck));
+
+    return section;
+  }
+
+  /* Iframe editor — embed an external URL. Live src text input rebuilds the
+     iframe (changing the src on the existing iframe element would also work,
+     but rebuild keeps the path uniform with every other element type). */
+  _buildIframeEditor(config) {
+    const section = this._peSection('Embed', true);
+    const content = config.content || (config.content = {});
+    const style = config.style || (config.style = {});
+
+    const srcInput = document.createElement('input');
+    srcInput.type = 'text';
+    srcInput.classList.add('pe-input');
+    srcInput.value = content.src || '';
+    srcInput.placeholder = '/games/stitch-arcade/';
+    srcInput.addEventListener('input', () => {
+      content.src = srcInput.value;
+      this._rebuildSelected();
+    });
+    section.appendChild(this._peField('URL', srcInput));
+
+    const titleInput = document.createElement('input');
+    titleInput.type = 'text';
+    titleInput.classList.add('pe-input');
+    titleInput.value = content.title || '';
+    titleInput.placeholder = 'Embedded content';
+    titleInput.addEventListener('input', () => {
+      content.title = titleInput.value || undefined;
+      this._rebuildSelected();
+    });
+    section.appendChild(this._peField('Title', titleInput));
+
+    const radiusInput = this._peNumberInput(style.borderRadius ?? 0, 0, 200, 1, (v) => {
+      style.borderRadius = v;
+      this.board.applyDesign(config.id);
+    });
+    section.appendChild(this._peField('Radius', radiusInput));
+
+    const opacityInput = this._peNumberInput(style.opacity ?? 1, 0, 1, 0.05, (v) => {
+      style.opacity = v;
+      this.board.applyDesign(config.id);
+    });
+    section.appendChild(this._peField('Opacity', opacityInput));
+
+    const rotInput = this._peNumberInput(style.rotation ?? 0, -180, 180, 1, (v) => {
+      style.rotation = v;
+      this.board.applyDesign(config.id);
+    });
+    section.appendChild(this._peField('Rotation°', rotInput));
+
+    const hint = document.createElement('div');
+    hint.classList.add('pe-hint');
+    hint.textContent = 'Click into the iframe in live mode to focus it (keys flow through). In edit mode the iframe is click-through so the panel stays draggable.';
+    section.appendChild(hint);
+
+    return section;
+  }
+
   // ── Split editor ──
 
   _buildSplitEditor(config) {
@@ -793,6 +1099,297 @@ export class EditMode {
     return wrap;
   }
 
+  // ── Viewport content list (panel-level) ──
+
+  _buildViewportContentList(config) {
+    if (!Array.isArray(config.contents)) config.contents = [];
+    const section = this._peSection('Contents', true);
+
+    const hint = document.createElement('div');
+    hint.classList.add('pe-hint');
+    hint.textContent = 'Right-click viewport to add text or image. Click a content block to edit it.';
+    section.appendChild(hint);
+
+    if (!config.contents.length) {
+      const empty = document.createElement('div');
+      empty.classList.add('pe-hint');
+      empty.style.cssText = 'margin-top:0.5rem;color:#888;';
+      empty.textContent = 'No content yet.';
+      section.appendChild(empty);
+    } else {
+      const list = document.createElement('div');
+      list.classList.add('pe-content-list');
+      config.contents.forEach((c, i) => {
+        const row = document.createElement('div');
+        row.classList.add('pe-content-row');
+        const label = document.createElement('span');
+        label.textContent = `${i + 1}. ${c.kind === 'text' ? 'Text' : 'Image'}`;
+        const editBtn = document.createElement('button');
+        editBtn.type = 'button';
+        editBtn.classList.add('edit-btn');
+        editBtn.textContent = 'Edit';
+        editBtn.addEventListener('click', () => this._selectElement(config.id, i));
+        const rm = document.createElement('button');
+        rm.type = 'button';
+        rm.classList.add('edit-btn');
+        rm.textContent = '✕';
+        rm.addEventListener('click', () => this._deleteContent(config.id, i));
+        row.append(label, editBtn, rm);
+        list.appendChild(row);
+      });
+      section.appendChild(list);
+    }
+
+    const addText = document.createElement('button');
+    addText.type = 'button';
+    addText.classList.add('edit-btn');
+    addText.textContent = '+ Text';
+    addText.addEventListener('click', () => this._addContent(config.id, 'text'));
+    const addImg = document.createElement('button');
+    addImg.type = 'button';
+    addImg.classList.add('edit-btn');
+    addImg.textContent = '+ Image';
+    addImg.addEventListener('click', () => this._addContent(config.id, 'image'));
+    const btnRow = document.createElement('div');
+    btnRow.style.cssText = 'display:flex;gap:0.25rem;margin-top:0.5rem;';
+    btnRow.append(addText, addImg);
+    section.appendChild(btnRow);
+
+    return section;
+  }
+
+  /** Add a new content block (text or image) to a viewport, then select it. */
+  _addContent(id, kind) {
+    const entry = this.board.elements.get(id);
+    if (!entry || entry.config.type !== 'viewport') return;
+    if (!Array.isArray(entry.config.contents)) entry.config.contents = [];
+
+    const baseFrame = { x: 20, y: 35, width: 60, height: 30, rotation: 0 };
+    let block;
+    if (kind === 'text') {
+      block = {
+        kind: 'text',
+        frame: baseFrame,
+        html: 'New text',
+        fontSize: 8,
+        fontFamily: 'Inter',
+        color: '#e8e8e8',
+        hAlign: 'left',
+        vAlign: 'flex-start',
+      };
+    } else {
+      block = {
+        kind: 'image',
+        frame: { x: 20, y: 20, width: 60, height: 60, rotation: 0 },
+        src: '/placeholder.svg',
+        alt: '',
+        fit: 'cover',
+        opacity: 1,
+      };
+    }
+    entry.config.contents.push(block);
+    this.board.rebuildElement(id);
+    this._selectElement(id, entry.config.contents.length - 1);
+  }
+
+  _deleteContent(id, idx) {
+    const entry = this.board.elements.get(id);
+    if (!entry || !Array.isArray(entry.config.contents)) return;
+    entry.config.contents.splice(idx, 1);
+    this.board.rebuildElement(id);
+    // If the deleted (or a later) content was selected, drop selection back to panel
+    if (this._selectedId === id && this._selectedContentIdx != null) {
+      if (this._selectedContentIdx >= entry.config.contents.length) {
+        this._selectElement(id, null);
+      } else {
+        this._selectElement(id, this._selectedContentIdx);
+      }
+    } else {
+      this._populatePanelEditor();
+    }
+  }
+
+  // ── Content-block editor (sidebar shows this when a content block is selected) ──
+
+  _renderContentEditor(body, config, idx) {
+    const c = config.contents[idx];
+    if (!c) {
+      body.innerHTML = '<div class="panel-editor-empty">Content not found</div>';
+      return;
+    }
+
+    // Header — kind label + Back-to-panel + Delete
+    const header = document.createElement('div');
+    header.classList.add('pe-header');
+    const kindLabel = document.createElement('div');
+    kindLabel.classList.add('pe-type-readonly');
+    kindLabel.textContent = c.kind === 'text' ? 'Text content' : 'Image content';
+    const backBtn = document.createElement('button');
+    backBtn.type = 'button';
+    backBtn.classList.add('edit-btn');
+    backBtn.textContent = '← Panel';
+    backBtn.addEventListener('click', () => this._selectElement(config.id, null));
+    header.append(kindLabel, backBtn);
+    body.appendChild(header);
+
+    if (c.kind === 'text') {
+      body.appendChild(this._buildContentTextEditor(config, idx, c));
+    } else {
+      body.appendChild(this._buildContentImageEditor(config, idx, c));
+    }
+
+    body.appendChild(this._buildContentFrameSection(config, idx, c));
+
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.classList.add('edit-btn');
+    delBtn.style.cssText = 'margin-top:0.75rem;color:#ff8888;border-color:#552222;';
+    delBtn.textContent = 'Delete content';
+    delBtn.addEventListener('click', () => this._deleteContent(config.id, idx));
+    body.appendChild(delBtn);
+  }
+
+  _buildContentTextEditor(config, idx, c) {
+    const section = this._peSection('Text', true);
+    const apply = () => this._rebuildKeepContent(config.id);
+
+    // Rich text
+    const rt = this._buildRichTextArea(c.html || '', (html) => {
+      c.html = html;
+      apply();
+    });
+    section.appendChild(this._peField('Text', rt));
+
+    // Font family
+    const fontSel = document.createElement('select');
+    fontSel.classList.add('pe-input');
+    ['Inter', ...FONT_LIST.filter(f => f !== 'Inter')].forEach(f => {
+      const opt = document.createElement('option');
+      opt.value = f; opt.textContent = f;
+      if ((c.fontFamily || 'Inter') === f) opt.selected = true;
+      fontSel.appendChild(opt);
+    });
+    fontSel.addEventListener('change', () => {
+      c.fontFamily = fontSel.value;
+      ensureFontLoaded(fontSel.value);
+      apply();
+    });
+    section.appendChild(this._peField('Font', fontSel));
+
+    const fsInput = this._peNumberInput(c.fontSize ?? 8, 1, 30, 0.5, (v) => {
+      c.fontSize = v; apply();
+    });
+    section.appendChild(this._peField('Size (cqi)', fsInput));
+
+    const colorInput = this._peColorInput(c.color || '#e8e8e8', (v) => {
+      c.color = v; apply();
+    });
+    section.appendChild(this._peField('Color', colorInput));
+
+    // H align
+    const hSel = document.createElement('select');
+    hSel.classList.add('pe-input');
+    ['left', 'center', 'right'].forEach(v => {
+      const opt = document.createElement('option');
+      opt.value = v; opt.textContent = v[0].toUpperCase() + v.slice(1);
+      if ((c.hAlign || 'left') === v) opt.selected = true;
+      hSel.appendChild(opt);
+    });
+    hSel.addEventListener('change', () => { c.hAlign = hSel.value; apply(); });
+    section.appendChild(this._peField('H align', hSel));
+
+    // V align
+    const vSel = document.createElement('select');
+    vSel.classList.add('pe-input');
+    [['top', 'flex-start'], ['center', 'center'], ['bottom', 'flex-end']].forEach(([lbl, val]) => {
+      const opt = document.createElement('option');
+      opt.value = val; opt.textContent = lbl[0].toUpperCase() + lbl.slice(1);
+      if ((c.vAlign || 'flex-start') === val) opt.selected = true;
+      vSel.appendChild(opt);
+    });
+    vSel.addEventListener('change', () => { c.vAlign = vSel.value; apply(); });
+    section.appendChild(this._peField('V align', vSel));
+
+    return section;
+  }
+
+  _buildContentImageEditor(config, idx, c) {
+    const section = this._peSection('Image', true);
+    const apply = () => this._rebuildKeepContent(config.id);
+
+    const srcInput = document.createElement('input');
+    srcInput.type = 'text';
+    srcInput.classList.add('pe-input');
+    srcInput.value = c.src || '';
+    srcInput.addEventListener('input', () => { c.src = srcInput.value; apply(); });
+    section.appendChild(this._peField('URL', srcInput));
+
+    const altInput = document.createElement('input');
+    altInput.type = 'text';
+    altInput.classList.add('pe-input');
+    altInput.value = c.alt || '';
+    altInput.addEventListener('input', () => { c.alt = altInput.value; apply(); });
+    section.appendChild(this._peField('Alt text', altInput));
+
+    const fitSel = document.createElement('select');
+    fitSel.classList.add('pe-input');
+    ['cover', 'contain', 'fill', 'none', 'scale-down'].forEach(v => {
+      const opt = document.createElement('option');
+      opt.value = v; opt.textContent = v;
+      if ((c.fit || 'cover') === v) opt.selected = true;
+      fitSel.appendChild(opt);
+    });
+    fitSel.addEventListener('change', () => { c.fit = fitSel.value; apply(); });
+    section.appendChild(this._peField('Fit', fitSel));
+
+    const opInput = document.createElement('input');
+    opInput.type = 'range';
+    opInput.classList.add('pe-input', 'pe-range');
+    opInput.min = '0'; opInput.max = '1'; opInput.step = '0.05';
+    opInput.value = c.opacity ?? 1;
+    opInput.addEventListener('input', () => { c.opacity = parseFloat(opInput.value); apply(); });
+    section.appendChild(this._peField('Opacity', opInput));
+
+    const capInput = document.createElement('input');
+    capInput.type = 'text';
+    capInput.classList.add('pe-input');
+    capInput.value = c.caption || '';
+    capInput.placeholder = 'Optional caption';
+    capInput.addEventListener('input', () => { c.caption = capInput.value || undefined; apply(); });
+    section.appendChild(this._peField('Caption', capInput));
+
+    return section;
+  }
+
+  _buildContentFrameSection(config, idx, c) {
+    if (!c.frame) c.frame = { x: 0, y: 0, width: 100, height: 100, rotation: 0 };
+    const f = c.frame;
+    const section = this._peSection('Frame', true);
+
+    const live = () => {
+      const node = this._findContentNode(config.id, idx);
+      if (node) applyContentFrame(node, f);
+      // Also keep the green frame overlay in sync
+      if (this._frameOverlay) {
+        const ov = this._frameOverlay.querySelector('.text-frame-overlay');
+        if (ov) {
+          ov.style.left = `${f.x}%`;
+          ov.style.top = `${f.y}%`;
+          ov.style.width = `${f.width}%`;
+          ov.style.height = `${f.height}%`;
+          ov.style.transform = f.rotation ? `rotate(${f.rotation}deg)` : '';
+        }
+      }
+    };
+
+    section.appendChild(this._peField('X %', this._peNumberInput(f.x, -50, 150, 1, (v) => { f.x = v; live(); })));
+    section.appendChild(this._peField('Y %', this._peNumberInput(f.y, -50, 150, 1, (v) => { f.y = v; live(); })));
+    section.appendChild(this._peField('W %', this._peNumberInput(f.width, 1, 200, 1, (v) => { f.width = v; live(); })));
+    section.appendChild(this._peField('H %', this._peNumberInput(f.height, 1, 200, 1, (v) => { f.height = v; live(); })));
+    section.appendChild(this._peField('Rotation', this._peNumberInput(f.rotation, -180, 180, 1, (v) => { f.rotation = v; live(); })));
+    return section;
+  }
+
   // ── Design editor ──
 
   _buildDesignEditor(config) {
@@ -846,6 +1443,16 @@ export class EditMode {
       applyDesign();
     });
     section.appendChild(this._peField('Opacity', opInput));
+
+    // Hover lift — drop shadow on hover in live preview
+    const hoverLiftCheck = document.createElement('input');
+    hoverLiftCheck.type = 'checkbox';
+    hoverLiftCheck.checked = s.hoverLift !== false;
+    hoverLiftCheck.addEventListener('change', () => {
+      s.hoverLift = hoverLiftCheck.checked;
+      applyDesign();
+    });
+    section.appendChild(this._peField('Hover lift', hoverLiftCheck));
 
     // Split side opacity
     if (config.type === 'split') {
@@ -942,6 +1549,32 @@ export class EditMode {
       section.appendChild(this._peField('Bg color', bgInput));
     }
 
+    // Texture — material overlay tinted by bg color. Panel-only (doesn't
+    // affect the stitched border or split halves).
+    if (config.type !== 'split') {
+      if (!s.texture) s.texture = { type: 'none' };
+      const texSel = document.createElement('select');
+      texSel.classList.add('pe-input');
+      [
+        ['none', 'Flat'],
+        ['felt', 'Felt'],
+        ['wool', 'Wool'],
+        ['denim', 'Denim'],
+        ['canvas', 'Canvas'],
+      ].forEach(([val, lbl]) => {
+        const opt = document.createElement('option');
+        opt.value = val;
+        opt.textContent = lbl;
+        if (s.texture.type === val) opt.selected = true;
+        texSel.appendChild(opt);
+      });
+      texSel.addEventListener('change', () => {
+        s.texture.type = texSel.value;
+        applyDesign();
+      });
+      section.appendChild(this._peField('Texture', texSel));
+    }
+
     return section;
   }
 
@@ -968,15 +1601,36 @@ export class EditMode {
     });
     section.appendChild(this._peField('Color', bcInput));
 
-    // Smooth
-    const smoothCheck = document.createElement('input');
-    smoothCheck.type = 'checkbox';
-    smoothCheck.checked = !!s.smooth;
-    smoothCheck.addEventListener('change', () => {
-      s.smooth = smoothCheck.checked;
+    // Edge mode — three modes, parallel to polygon shapes:
+    //   sharp:   straight anchor-to-anchor segments
+    //   rounded: straight segments + corners rounded by borderRadius
+    //   curve:   Chaikin curve through every anchor (legacy `smooth: true`)
+    const edgeMode = s.edge || (s.smooth ? 'curve' : 'sharp');
+    const edgeSel = document.createElement('select');
+    edgeSel.classList.add('pe-input');
+    [['sharp', 'Sharp'], ['rounded', 'Rounded corners'], ['curve', 'Curve']].forEach(([val, lbl]) => {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = lbl;
+      if (val === edgeMode) opt.selected = true;
+      edgeSel.appendChild(opt);
+    });
+    edgeSel.addEventListener('change', () => {
+      s.edge = edgeSel.value;
+      delete s.smooth; // edge supersedes the legacy boolean
+      this._populatePanelEditor(); // re-render so the radius field shows/hides
       applyDesign();
     });
-    section.appendChild(this._peField('Smooth', smoothCheck));
+    section.appendChild(this._peField('Edge', edgeSel));
+
+    // Corner radius — only meaningful in rounded mode
+    if (edgeMode === 'rounded') {
+      const crInput = this._peNumberInput(s.borderRadius ?? 8, 0, 200, 1, (v) => {
+        s.borderRadius = v;
+        applyDesign();
+      });
+      section.appendChild(this._peField('Corner r', crInput));
+    }
 
     // Opacity
     const opInput = document.createElement('input');
@@ -992,6 +1646,16 @@ export class EditMode {
     });
     section.appendChild(this._peField('Opacity', opInput));
 
+    // Hover lift — drop shadow on hover in live preview
+    const hoverLiftCheck = document.createElement('input');
+    hoverLiftCheck.type = 'checkbox';
+    hoverLiftCheck.checked = s.hoverLift !== false;
+    hoverLiftCheck.addEventListener('change', () => {
+      s.hoverLift = hoverLiftCheck.checked;
+      applyDesign();
+    });
+    section.appendChild(this._peField('Hover lift', hoverLiftCheck));
+
     // Anchor count
     const anchors = config.content?.anchors || [];
     section.appendChild(this._peReadonly('Anchors', `${anchors.length}`));
@@ -1004,7 +1668,251 @@ export class EditMode {
     return section;
   }
 
+  // ── Border effect (stitched border) ──
+
+  _buildBorderStitchSection(config) {
+    if (!config.style) config.style = {};
+    const s = config.style;
+    if (!s.borderStitch) s.borderStitch = { enabled: false, style: 'running', animated: true };
+    const bs = s.borderStitch;
+    bs.style = bs.style || 'running';
+    bs.stitchLen = bs.stitchLen ?? 8;
+    bs.duration = bs.duration ?? 1.0;
+    bs.palette = bs.palette || 'border';
+    bs.flow = !!bs.flow;
+    bs.flowDir = bs.flowDir || 'cw';
+    bs.flowSpeed = bs.flowSpeed ?? 60;
+    bs.colorBlend = !!bs.colorBlend;
+
+    const section = this._peSection('Border effect');
+    const apply = () => {
+      this.board.applyDesign(config.id);
+      // Replay the entrance draw so the user sees the change immediately
+      const entry = this.board.elements.get(config.id);
+      if (entry?.borderStitch && bs.enabled) {
+        entry.borderStitch.play();
+      }
+    };
+
+    // Style dropdown — first option "Off" = disabled
+    const styleSelect = document.createElement('select');
+    styleSelect.classList.add('pe-input');
+    const STYLES = [
+      ['none', 'Off'],
+      ['running', 'Running'],
+      ['backstitch', 'Backstitch'],
+      ['zigzag', 'Zigzag'],
+      ['chain', 'Chain'],
+      ['satin', 'Satin'],
+      ['mixed', 'Mixed'],
+      ['cross', 'Cross'],
+      ['blanket', 'Blanket'],
+      ['whip', 'Whip'],
+      ['herringbone', 'Herringbone'],
+      ['stem', 'Stem'],
+      ['feather', 'Feather'],
+      ['fishbone', 'Fishbone'],
+      ['couching', 'Couching'],
+      ['frenchKnot', 'French knot'],
+    ];
+    STYLES.forEach(([val, lbl]) => {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = lbl;
+      if ((bs.enabled ? bs.style : 'none') === val) opt.selected = true;
+      styleSelect.appendChild(opt);
+    });
+    styleSelect.addEventListener('change', () => {
+      if (styleSelect.value === 'none') {
+        bs.enabled = false;
+      } else {
+        bs.enabled = true;
+        bs.style = styleSelect.value;
+      }
+      this._populatePanelEditor(); // re-render so subfields show/hide
+      apply();
+    });
+    section.appendChild(this._peField('Style', styleSelect));
+
+    if (!bs.enabled) return section;
+
+    // Animated checkbox
+    const animCheck = document.createElement('input');
+    animCheck.type = 'checkbox';
+    animCheck.checked = bs.animated !== false;
+    animCheck.addEventListener('change', () => {
+      bs.animated = animCheck.checked;
+      this._populatePanelEditor();
+      apply();
+    });
+    section.appendChild(this._peField('Animated', animCheck));
+
+    // Entrance duration (only meaningful if animated)
+    if (bs.animated !== false) {
+      const durInput = this._peNumberInput(bs.duration, 0.1, 10, 0.1, (v) => {
+        bs.duration = v; apply();
+      });
+      section.appendChild(this._peField('Draw time (s)', durInput));
+    }
+
+    // Stitch size
+    const sizeInput = this._peNumberInput(bs.stitchLen, 3, 30, 1, (v) => {
+      bs.stitchLen = v; apply();
+    });
+    section.appendChild(this._peField('Stitch size', sizeInput));
+
+    // Palette
+    const palSelect = document.createElement('select');
+    palSelect.classList.add('pe-input');
+    [['border', 'Border color'], ['warm', 'Warm'], ['cool', 'Cool'], ['pastel', 'Pastel'], ['mono', 'Mono'], ['custom', 'Custom']].forEach(([val, lbl]) => {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = lbl;
+      if (bs.palette === val) opt.selected = true;
+      palSelect.appendChild(opt);
+    });
+    palSelect.addEventListener('change', () => {
+      bs.palette = palSelect.value;
+      // Seed customColors when entering custom
+      if (bs.palette === 'custom' && (!Array.isArray(bs.customColors) || !bs.customColors.length)) {
+        const seed = STITCH_PALETTES.warm;
+        bs.customColors = seed.slice(0, 3);
+      }
+      this._populatePanelEditor();
+      apply();
+    });
+    section.appendChild(this._peField('Palette', palSelect));
+
+    // Custom colors editor
+    if (bs.palette === 'custom') {
+      const listWrap = document.createElement('div');
+      listWrap.classList.add('pe-color-list');
+      const renderList = () => {
+        listWrap.innerHTML = '';
+        (bs.customColors || []).forEach((c, i) => {
+          const row = document.createElement('div');
+          row.classList.add('pe-color-list-item');
+          const inp = document.createElement('input');
+          inp.type = 'color';
+          inp.value = c;
+          inp.addEventListener('input', () => {
+            bs.customColors[i] = inp.value; apply();
+          });
+          const rm = document.createElement('button');
+          rm.type = 'button';
+          rm.classList.add('pe-color-list-rm');
+          rm.textContent = '✕';
+          rm.disabled = bs.customColors.length <= 1;
+          rm.addEventListener('click', () => {
+            if (bs.customColors.length > 1) {
+              bs.customColors.splice(i, 1);
+              renderList(); apply();
+            }
+          });
+          row.append(inp, rm);
+          listWrap.appendChild(row);
+        });
+        const add = document.createElement('button');
+        add.type = 'button';
+        add.classList.add('pe-color-list-add');
+        add.textContent = '+ Add color';
+        add.addEventListener('click', () => {
+          const last = bs.customColors[bs.customColors.length - 1] || '#cccccc';
+          bs.customColors.push(last);
+          renderList(); apply();
+        });
+        listWrap.appendChild(add);
+      };
+      renderList();
+      section.appendChild(this._peField('Colors', listWrap));
+    }
+
+    // Color blend — smooth interpolation between adjacent palette colors,
+    // only meaningful when the palette resolves to more than one color.
+    const usingMultiColors = (bs.palette !== 'border')
+      && (bs.palette === 'custom'
+        ? Array.isArray(bs.customColors) && bs.customColors.length > 1
+        : (STITCH_PALETTES[bs.palette]?.length || 0) > 1);
+    if (usingMultiColors) {
+      const blendCheck = document.createElement('input');
+      blendCheck.type = 'checkbox';
+      blendCheck.checked = !!bs.colorBlend;
+      blendCheck.title = 'Smooth fade between palette colors instead of hard color bands';
+      blendCheck.addEventListener('change', () => {
+        bs.colorBlend = blendCheck.checked;
+        apply();
+      });
+      section.appendChild(this._peField('Blend colors', blendCheck));
+    }
+
+    // Flow (continuous palette drift around the perimeter)
+    const flowCheck = document.createElement('input');
+    flowCheck.type = 'checkbox';
+    flowCheck.checked = !!bs.flow;
+    flowCheck.addEventListener('change', () => {
+      bs.flow = flowCheck.checked;
+      this._populatePanelEditor();
+      apply();
+    });
+    section.appendChild(this._peField('Color flow', flowCheck));
+
+    if (bs.flow) {
+      const dirSelect = document.createElement('select');
+      dirSelect.classList.add('pe-input');
+      [['cw', 'Clockwise'], ['ccw', 'Counter-clockwise']].forEach(([val, lbl]) => {
+        const opt = document.createElement('option');
+        opt.value = val; opt.textContent = lbl;
+        if (bs.flowDir === val) opt.selected = true;
+        dirSelect.appendChild(opt);
+      });
+      dirSelect.addEventListener('change', () => { bs.flowDir = dirSelect.value; apply(); });
+      section.appendChild(this._peField('Direction', dirSelect));
+
+      const speedInput = this._peNumberInput(bs.flowSpeed, 5, 400, 5, (v) => {
+        bs.flowSpeed = v; apply();
+      });
+      section.appendChild(this._peField('Flow speed', speedInput));
+    }
+
+    return section;
+  }
+
   // ── Animation editor ──
+
+  /** Spawn section — when does this element first appear? Lives outside the
+   *  Animation section so it applies even when no entrance animation is
+   *  configured (lines, plain panels). Defaults make the section a no-op:
+   *  spawn row = element's gridRow, delay = 0. */
+  _buildSpawnSection(config) {
+    const section = this._peSection('Spawn');
+
+    // One-time migration: older layouts kept the entrance trigger row inside
+    // animation.triggerRow and a brief experiment kept entranceDelay there
+    // too. Lift them onto config.* on first edit so the new fields become
+    // authoritative; future saves don't have to read both.
+    const a = config.animation;
+    if (config.spawnRow == null && a?.triggerRow != null) config.spawnRow = a.triggerRow;
+    if (config.spawnDelay == null && a?.entranceDelay != null) config.spawnDelay = a.entranceDelay;
+
+    const rowInput = this._peNumberInput(
+      config.spawnRow ?? config.gridRow, 1, 999, 1,
+      (v) => { config.spawnRow = v; },
+    );
+    section.appendChild(this._peField('Spawn row', rowInput));
+
+    const delayInput = this._peNumberInput(
+      config.spawnDelay ?? 0, 0, 10, 0.05,
+      (v) => { config.spawnDelay = v; },
+    );
+    section.appendChild(this._peField('Delay (s)', delayInput));
+
+    const hint = document.createElement('div');
+    hint.classList.add('pe-hint');
+    hint.textContent = 'Element appears when scroll reaches the spawn row, then waits this long before showing. Works without animation.';
+    section.appendChild(hint);
+
+    return section;
+  }
 
   _buildAnimationEditor(config) {
     const defaultDur = 0.6;
@@ -1073,14 +1981,13 @@ export class EditMode {
     entranceSel.addEventListener('change', () => { a.entrance = entranceSel.value; });
     fields.appendChild(this._peField('Entrance', entranceSel));
 
-    // Entrance row + duration
-    fields.appendChild(buildRowDurPair(
-      'Entrance row',
-      a.triggerRow ?? defaultRow,
-      a.entranceDuration ?? defaultDur,
-      (v) => { a.triggerRow = v; },
+    // Entrance duration only — the trigger row + delay live in the Spawn
+    // section now (they apply with or without animation).
+    const entranceDurInput = this._peNumberInput(
+      a.entranceDuration ?? defaultDur, 0.1, 3, 0.1,
       (v) => { a.entranceDuration = v; },
-    ));
+    );
+    fields.appendChild(this._peField('Entrance duration (s)', entranceDurInput));
 
     // Exit effect
     const exitEffects = [
@@ -1101,10 +2008,12 @@ export class EditMode {
     exitSel.addEventListener('change', () => { a.exit = exitSel.value; });
     fields.appendChild(this._peField('Exit', exitSel));
 
-    // Exit row + duration
+    // Exit row + duration. Fallback chain: explicit exitTriggerRow → spawnRow
+    // (the new home for what used to be triggerRow) → legacy triggerRow →
+    // gridRow.
     fields.appendChild(buildRowDurPair(
       'Exit row',
-      a.exitTriggerRow ?? a.triggerRow ?? defaultRow,
+      a.exitTriggerRow ?? config.spawnRow ?? a.triggerRow ?? defaultRow,
       a.exitDuration ?? defaultDur,
       (v) => { a.exitTriggerRow = v; },
       (v) => { a.exitDuration = v; },
@@ -1132,10 +2041,10 @@ export class EditMode {
     scrollSel.addEventListener('change', () => { a.scroll = scrollSel.value; });
     fields.appendChild(this._peField('Scroll effect', scrollSel));
 
-    // Scroll row + duration
+    // Scroll row + duration. Same fallback chain as exit row.
     fields.appendChild(buildRowDurPair(
       'Scroll row',
-      a.scrollTriggerRow ?? a.triggerRow ?? defaultRow,
+      a.scrollTriggerRow ?? config.spawnRow ?? a.triggerRow ?? defaultRow,
       a.scrollDuration ?? defaultDur,
       (v) => { a.scrollTriggerRow = v; },
       (v) => { a.scrollDuration = v; },
@@ -1312,9 +2221,10 @@ export class EditMode {
       this._frameOverlay = null;
     }
     this._frameEditId = null;
+    this._frameTarget = null;
   }
 
-  _showFrameHandles(id) {
+  _showFrameHandles(id, contentIdx = null) {
     // Remove old overlay
     if (this._frameOverlay) {
       this._frameOverlay.remove();
@@ -1324,11 +2234,20 @@ export class EditMode {
     const entry = this.board.elements.get(id);
     if (!entry) return;
     const { config, wrapper } = entry;
-    const content = config.content;
-    if (!content.frame) {
-      content.frame = { x: 0, y: 0, width: 100, height: 100, rotation: 0 };
+
+    // Resolve the frame source: a viewport content block when contentIdx is
+    // given, otherwise a legacy text panel's content.frame.
+    let target;
+    if (contentIdx != null && Array.isArray(config.contents) && config.contents[contentIdx]) {
+      target = config.contents[contentIdx];
+    } else {
+      target = config.content;
     }
-    const f = content.frame;
+    if (!target.frame) {
+      target.frame = { x: 0, y: 0, width: 100, height: 100, rotation: 0 };
+    }
+    const f = target.frame;
+    this._frameTarget = { id, contentIdx };
 
     // Create frame overlay as a grid sibling (not a wrapper child)
     // so it's never clipped by overflow:hidden or clip-path
@@ -1381,13 +2300,31 @@ export class EditMode {
     this._frameOverlay = container;
   }
 
-  /** Update the .block-text element's frame styles without a full rebuild. */
-  _applyFrameStyle(id) {
+  /** Resolve the active frame target — either a viewport content block or a
+   *  legacy text panel's content.frame — without a full rebuild. */
+  _resolveFrameTarget(id) {
     const entry = this.board.elements.get(id);
-    if (!entry) return;
-    const el = entry.element;
-    const f = entry.config.content.frame;
-    if (!el || !f) return;
+    if (!entry) return null;
+    const tgt = this._frameTarget;
+    if (tgt && tgt.id === id && tgt.contentIdx != null) {
+      const c = entry.config.contents?.[tgt.contentIdx];
+      if (c) return { entry, frame: c.frame, contentIdx: tgt.contentIdx };
+    }
+    return { entry, frame: entry.config.content?.frame, contentIdx: null };
+  }
+
+  /** Update the live element's frame styles without a full rebuild. */
+  _applyFrameStyle(id) {
+    const t = this._resolveFrameTarget(id);
+    if (!t || !t.frame) return;
+    const f = t.frame;
+    if (t.contentIdx != null) {
+      const node = this._findContentNode(id, t.contentIdx);
+      if (node) applyContentFrame(node, f);
+      return;
+    }
+    const el = t.entry.element;
+    if (!el) return;
     if (f.x || f.y || f.width !== 100 || f.height !== 100 || f.rotation) {
       el.style.position = 'absolute';
       el.style.left = `${f.x}%`;
@@ -1408,11 +2345,19 @@ export class EditMode {
   /** Drag the text frame directly when the panel is already selected.
    *  No clamping — the panel clips via overflow:hidden. */
   _startInlineFrameDrag(id, wrapper, e) {
-    const entry = this.board.elements.get(id);
-    if (!entry) return;
-    const content = entry.config.content;
-    if (!content.frame) content.frame = { x: 0, y: 0, width: 100, height: 100, rotation: 0 };
-    const f = content.frame;
+    const t = this._resolveFrameTarget(id);
+    if (!t) return;
+    if (!t.frame) {
+      // Initialize frame on the resolved owner
+      const entry = this.board.elements.get(id);
+      if (!entry) return;
+      const owner = (t.contentIdx != null)
+        ? entry.config.contents[t.contentIdx]
+        : entry.config.content;
+      owner.frame = { x: 0, y: 0, width: 100, height: 100, rotation: 0 };
+      t.frame = owner.frame;
+    }
+    const f = t.frame;
     const rect = wrapper.getBoundingClientRect();
     const startX = e.clientX;
     const startY = e.clientY;
@@ -1428,6 +2373,7 @@ export class EditMode {
       f.x = Math.round(startFx + dx);
       f.y = Math.round(startFy + dy);
       this._applyFrameStyle(id);
+      this._syncFrameOverlayPos(f);
     };
 
     const onUp = () => {
@@ -1442,11 +2388,24 @@ export class EditMode {
     wrapper.addEventListener('pointerup', onUp);
   }
 
+  /** Update the live frame overlay's left/top/width/height/transform from a
+   *  frame object. No-op when no overlay is currently shown. */
+  _syncFrameOverlayPos(f) {
+    if (!this._frameOverlay) return;
+    const ov = this._frameOverlay.querySelector('.text-frame-overlay');
+    if (!ov) return;
+    ov.style.left = `${f.x}%`;
+    ov.style.top = `${f.y}%`;
+    ov.style.width = `${f.width}%`;
+    ov.style.height = `${f.height}%`;
+    ov.style.transform = f.rotation ? `rotate(${f.rotation}deg)` : '';
+  }
+
   _startFrameDrag(id, overlay, e) {
-    const entry = this.board.elements.get(id);
-    if (!entry) return;
-    const wrapper = entry.wrapper;
-    const f = entry.config.content.frame;
+    const t = this._resolveFrameTarget(id);
+    if (!t || !t.frame) return;
+    const wrapper = t.entry.wrapper;
+    const f = t.frame;
     const rect = wrapper.getBoundingClientRect();
     const startX = e.clientX;
     const startY = e.clientY;
@@ -1476,10 +2435,10 @@ export class EditMode {
   }
 
   _startFrameResize(id, overlay, corner, e) {
-    const entry = this.board.elements.get(id);
-    if (!entry) return;
-    const wrapper = entry.wrapper;
-    const f = entry.config.content.frame;
+    const t = this._resolveFrameTarget(id);
+    if (!t || !t.frame) return;
+    const wrapper = t.entry.wrapper;
+    const f = t.frame;
     const rect = wrapper.getBoundingClientRect();
     const startX = e.clientX;
     const startY = e.clientY;
@@ -1490,23 +2449,26 @@ export class EditMode {
 
     overlay.setPointerCapture(e.pointerId);
 
+    // Frames are allowed to extend beyond the panel — the panel's .shape-clip
+    // layer clips visually, but the data can hold any positive size and any
+    // x/y (including negative or > 100% for offscreen content).
     const onMove = (me) => {
       const dx = ((me.clientX - startX) / rect.width) * 100;
       const dy = ((me.clientY - startY) / rect.height) * 100;
 
       if (corner.includes('right')) {
-        f.width = Math.round(Math.max(5, Math.min(100 - f.x, startFw + dx)));
+        f.width = Math.round(Math.max(5, startFw + dx));
       }
       if (corner.includes('left')) {
-        const newX = Math.max(0, startFx + dx);
+        const newX = startFx + dx;
         const newW = startFw - (newX - startFx);
         if (newW >= 5) { f.x = Math.round(newX); f.width = Math.round(newW); }
       }
       if (corner.includes('bottom')) {
-        f.height = Math.round(Math.max(5, Math.min(100 - f.y, startFh + dy)));
+        f.height = Math.round(Math.max(5, startFh + dy));
       }
       if (corner.includes('top')) {
-        const newY = Math.max(0, startFy + dy);
+        const newY = startFy + dy;
         const newH = startFh - (newY - startFy);
         if (newH >= 5) { f.y = Math.round(newY); f.height = Math.round(newH); }
       }
@@ -1529,10 +2491,10 @@ export class EditMode {
   }
 
   _startFrameRotate(id, overlay, e) {
-    const entry = this.board.elements.get(id);
-    if (!entry) return;
-    const wrapper = entry.wrapper;
-    const f = entry.config.content.frame;
+    const t = this._resolveFrameTarget(id);
+    if (!t || !t.frame) return;
+    const wrapper = t.entry.wrapper;
+    const f = t.frame;
     const rect = wrapper.getBoundingClientRect();
 
     // Center of the frame in viewport coords
@@ -1689,6 +2651,24 @@ export class EditMode {
         return;
       }
 
+      // Viewport: clicking a content node selects/drags that content block.
+      // Empty area falls through to panel select+drag.
+      if (config.type === 'viewport') {
+        const node = e.target.closest('.viewport-content');
+        const liveEntry = this.board.elements.get(config.id);
+        if (node && liveEntry && node.parentElement === liveEntry.element) {
+          const idx = parseInt(node.dataset.contentIdx, 10);
+          e.preventDefault();
+          if (this._selectedId !== config.id || this._selectedContentIdx !== idx) {
+            this._selectElement(config.id, idx);
+          }
+          // Drag the content frame
+          this._frameTarget = { id: config.id, contentIdx: idx };
+          this._startInlineFrameDrag(config.id, wrapper, e);
+          return;
+        }
+      }
+
       // Already-selected text panel: drag the text frame instead of the panel
       if (config.type === 'text' && this._selectedId === config.id) {
         e.preventDefault();
@@ -1735,8 +2715,16 @@ export class EditMode {
     e.preventDefault();
     const containerRect = this.board.container.getBoundingClientRect();
     const config = this.board.elements.get(id).config;
-    const cellW = containerRect.width / this.board.columns;
     const zoom = this.board._zoomFactor || 1;
+    // cellW used here represents grid PITCH (cell + gap), matching how cellH
+    // is computed below. The previous `containerWidth / columns` formula
+    // ignored the gap entirely, which underestimated pitch by `gap/columns`
+    // px per column — a small per-cell error that compounded with column
+    // index. Symptom was a duplicated panel acting like its spawn position
+    // was its top-left clamp: offsetCols/Rows captured at click time were
+    // slightly off, so cell.col - offsetCols pinned at the spawn cell when
+    // the cursor moved leftward over the gap regions.
+    const cellW = (containerRect.width + this.board.gap * zoom) / this.board.columns;
     const cellH = (this.board.rowHeight + this.board.gap) * zoom;
 
     const elLeft = (config.gridColumn - 1) * cellW + containerRect.left;
@@ -1837,8 +2825,9 @@ export class EditMode {
   _handleResizeMove(e) {
     const { edge, startX, startY, startCol, startRow, startColSpan, startRowSpan, id, wrapper } = this.resizing;
     const containerRect = this.board.container.getBoundingClientRect();
-    const cellW = containerRect.width / this.board.columns;
     const zoom = this.board._zoomFactor || 1;
+    // Grid pitch — see _startDrag for why this is gap-aware.
+    const cellW = (containerRect.width + this.board.gap * zoom) / this.board.columns;
     const cellH = (this.board.rowHeight + this.board.gap) * zoom;
 
     const dCols = Math.round((e.clientX - startX) / cellW);
@@ -1934,7 +2923,18 @@ export class EditMode {
 
     const containerRect = this.board.container.getBoundingClientRect();
     const cell = this._clientToCell(e.clientX, e.clientY, containerRect);
-    const clickedElement = e.target.closest('.peg-element');
+    let clickedElement = e.target.closest('.peg-element');
+    // Right-clicking the frame overlay (grid sibling — not a panel child) acts
+    // as a right-click on the content block it represents.
+    let overlayContentTarget = null;
+    if (!clickedElement && e.target.closest('.text-frame-container')
+        && this._frameTarget && this._frameTarget.contentIdx != null) {
+      const fEntry = this.board.elements.get(this._frameTarget.id);
+      if (fEntry) {
+        clickedElement = fEntry.wrapper;
+        overlayContentTarget = this._frameTarget.contentIdx;
+      }
+    }
 
     const menu = document.createElement('div');
     menu.classList.add('edit-context-menu');
@@ -1943,6 +2943,43 @@ export class EditMode {
 
     if (clickedElement) {
       const id = clickedElement.dataset.id;
+      const entry = this.board.elements.get(id);
+
+      // Viewport-aware: detect right-click on a content node vs. empty area
+      const contentNode = e.target.closest('.viewport-content');
+      const onContent = (overlayContentTarget != null)
+        || (contentNode
+          && entry?.config?.type === 'viewport'
+          && contentNode.parentElement === entry.element);
+
+      if (onContent) {
+        const idx = (overlayContentTarget != null)
+          ? overlayContentTarget
+          : parseInt(contentNode.dataset.contentIdx, 10);
+        this._addMenuItem(menu, 'Edit content', () => {
+          this._selectElement(id, idx);
+          this._dismissMenu();
+        });
+        this._addMenuItem(menu, 'Delete content', () => {
+          this._deleteContent(id, idx);
+          this._dismissMenu();
+        });
+        const sep = document.createElement('div');
+        sep.style.cssText = 'border-top:1px solid #2a2a2a;margin:0.25rem 0;';
+        menu.appendChild(sep);
+      } else if (entry?.config?.type === 'viewport') {
+        this._addMenuItem(menu, 'Add text', () => {
+          this._addContent(id, 'text');
+          this._dismissMenu();
+        });
+        this._addMenuItem(menu, 'Add image', () => {
+          this._addContent(id, 'image');
+          this._dismissMenu();
+        });
+        const sep = document.createElement('div');
+        sep.style.cssText = 'border-top:1px solid #2a2a2a;margin:0.25rem 0;';
+        menu.appendChild(sep);
+      }
 
       {
         const entry = this.board.elements.get(id);
@@ -1977,24 +3014,36 @@ export class EditMode {
       this._addDeleteConfirmItem(menu, id);
     } else {
       const shapes = ['Rectangle', 'Circle', 'Triangle'];
-      const types = [
-        { label: 'Text', type: 'text' },
-        { label: 'Image', type: 'image' },
-        { label: 'Split', type: 'split' },
-      ];
-      types.forEach(({ label, type }) => {
-        this._addSubmenu(menu, `${label} panel`, shapes.map(shape => ({
-          label: shape,
-          action: () => {
-            this._enterDrawMode(type, shape.toLowerCase());
-            this._dismissMenu();
-          },
-        })));
-      });
+      // New panels default to viewport type — empty container that hosts
+      // text/image content blocks added via right-click.
+      this._addSubmenu(menu, 'New panel', shapes.map(shape => ({
+        label: shape,
+        action: () => {
+          this._enterDrawMode('viewport', shape.toLowerCase());
+          this._dismissMenu();
+        },
+      })));
+      this._addSubmenu(menu, 'Split panel', shapes.map(shape => ({
+        label: shape,
+        action: () => {
+          this._enterDrawMode('split', shape.toLowerCase());
+          this._dismissMenu();
+        },
+      })));
 
       this._addMenuItem(menu, 'Add line', () => {
         this._enterLineMode();
         this._dismissMenu();
+      });
+
+      this._addMenuItem(menu, 'Add image', () => {
+        this._dismissMenu();
+        this._addPictureAtCell(cell);
+      });
+
+      this._addMenuItem(menu, 'Add iframe', () => {
+        this._dismissMenu();
+        this._addIframeAtCell(cell);
       });
 
       this._addMenuItem(menu, 'Background settings', () => {
@@ -2211,6 +3260,7 @@ export class EditMode {
         left: { type: 'text', fontSize: 9, text: 'Left' },
         right: { type: 'image', src: '/placeholder.svg', alt: 'Right' },
       },
+      viewport: null, // viewport stores contents in config.contents, not config.content
     };
 
     const config = {
@@ -2220,9 +3270,17 @@ export class EditMode {
       gridRow: row,
       colSpan,
       rowSpan,
-      content: defaults[type],
       style: {},
     };
+    if (type === 'viewport') {
+      config.contents = [];
+      // Soft red default border so freshly-created viewports are easy to spot
+      config.style.borderColor = '#cc4444';
+      config.style.borderWidth = 2;
+      config.style.bgColor = '#141414';
+    } else {
+      config.content = defaults[type];
+    }
 
     // Apply shape preset
     if (shapePreset === 'circle') {
@@ -2235,10 +3293,121 @@ export class EditMode {
           { x: colSpan, y: rowSpan },
           { x: 0, y: rowSpan },
         ],
-        smooth: false,
+        edge: 'sharp',
       };
     }
 
+    this.board.addElement(config);
+    const entry = this.board.elements.get(config.id);
+    if (entry) {
+      this._makeEditable(entry.wrapper, entry.config);
+      this._selectElement(config.id);
+    }
+  }
+
+  /* Add a picture (free-floating image) at the given grid cell. Pops a hidden
+     file input, reads the file as a data URL, posts to /api/upload-image to
+     persist it under public/uploads/, then creates a picture element sized to
+     the image's natural aspect ratio (capped at 12 cols / 8 rows). */
+  _addPictureAtCell(cell) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/png,image/jpeg,image/webp,image/gif,image/svg+xml';
+    input.style.display = 'none';
+    document.body.appendChild(input);
+    input.addEventListener('change', async () => {
+      const file = input.files && input.files[0];
+      input.remove();
+      if (!file) return;
+      try {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+        const naturalSize = await new Promise((resolve) => {
+          const img = new Image();
+          img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
+          img.onerror = () => resolve({ w: 1, h: 1 });
+          img.src = dataUrl;
+        });
+
+        const res = await fetch('/api/upload-image', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dataUrl, mime: file.type }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          this._flash(`Upload failed: ${data.error || 'unknown'}`);
+          return;
+        }
+
+        // Size to natural aspect ratio, max 12x8 grid cells.
+        const maxCols = 12, maxRows = 8;
+        const aspect = naturalSize.w / naturalSize.h;
+        let colSpan, rowSpan;
+        if (aspect >= 1) {
+          colSpan = maxCols;
+          rowSpan = Math.max(1, Math.round(maxCols / aspect));
+          if (rowSpan > maxRows) {
+            rowSpan = maxRows;
+            colSpan = Math.max(1, Math.round(maxRows * aspect));
+          }
+        } else {
+          rowSpan = maxRows;
+          colSpan = Math.max(1, Math.round(maxRows * aspect));
+        }
+
+        const col = Math.max(1, Math.min(this.board.columns - colSpan + 1, cell.col));
+        const row = Math.max(1, cell.row);
+
+        const config = {
+          id: uniqueId('picture'),
+          type: 'picture',
+          gridColumn: col,
+          gridRow: row,
+          colSpan,
+          rowSpan,
+          layer: 1,
+          content: { src: data.path, alt: file.name, fit: 'contain' },
+          style: { rotation: 0, opacity: 1, hoverLift: false },
+        };
+        this.board.addElement(config);
+        const entry = this.board.elements.get(config.id);
+        if (entry) {
+          this._makeEditable(entry.wrapper, entry.config);
+          this._selectElement(config.id);
+        }
+      } catch (err) {
+        this._flash(`Upload failed: ${err.message || err}`);
+      }
+    });
+    input.click();
+  }
+
+  /* Add a blank iframe panel at the given grid cell. Defaults to the stitch
+     arcade game URL since that's the first embed; users can edit the URL in
+     the sidebar afterward. Default size (8×10 cells) accommodates the game's
+     ~560×640 cabinet at typical zoom; resize as desired. */
+  _addIframeAtCell(cell) {
+    const colSpan = 8;
+    const rowSpan = 10;
+    const col = Math.max(1, Math.min(this.board.columns - colSpan + 1, cell.col));
+    const row = Math.max(1, cell.row);
+
+    const config = {
+      id: uniqueId('iframe'),
+      type: 'iframe',
+      gridColumn: col,
+      gridRow: row,
+      colSpan,
+      rowSpan,
+      layer: 1,
+      content: { src: '/games/stitch-arcade/', title: 'Stitch Arcade' },
+      style: { borderRadius: 0, opacity: 1, rotation: 0, hoverLift: false },
+    };
     this.board.addElement(config);
     const entry = this.board.elements.get(config.id);
     if (entry) {
@@ -2617,8 +3786,9 @@ export class EditMode {
   _clientToCell(clientX, clientY, containerRect) {
     const x = clientX - containerRect.left;
     const y = clientY - containerRect.top;
-    const cellW = containerRect.width / this.board.columns;
     const zoom = this.board._zoomFactor || 1;
+    // Grid pitch — see _startDrag for why this is gap-aware.
+    const cellW = (containerRect.width + this.board.gap * zoom) / this.board.columns;
     const cellH = (this.board.rowHeight + this.board.gap) * zoom;
     return {
       col: Math.max(1, Math.floor(x / cellW) + 1),
@@ -2636,9 +3806,14 @@ export class EditMode {
     const state = original
       ? { ...original }
       : { type: 'solid', color1: '#0a0a0a', color2: '#1a1a3a', angle: 135, preset: 'flow' };
-    // Ensure defaults exist for fields that may be missing
-    state.color1 = state.color1 || '#0a0a0a';
-    state.color2 = state.color2 || '#1a1a3a';
+    // Ensure defaults exist for fields that may be missing. Migrate older
+    // two-stop layouts (color1/color2) into the canonical `colors` array; the
+    // legacy fields are dropped so the UI doesn't have to re-sync them.
+    if (!Array.isArray(state.colors) || state.colors.length === 0) {
+      state.colors = [state.color1 || '#0a0a0a', state.color2 || '#1a1a3a'];
+    }
+    delete state.color1;
+    delete state.color2;
     state.angle = state.angle ?? 135;
     state.preset = state.preset || 'flow';
 
@@ -2685,19 +3860,62 @@ export class EditMode {
     });
     typeRow.appendChild(typeSel);
 
-    // Color 1
-    const color1Row = mkField('Color');
-    const color1Input = document.createElement('input');
-    color1Input.type = 'color';
-    color1Input.value = state.color1;
-    color1Row.appendChild(color1Input);
-
-    // Color 2
-    const color2Row = mkField('Color 2');
-    const color2Input = document.createElement('input');
-    color2Input.type = 'color';
-    color2Input.value = state.color2;
-    color2Row.appendChild(color2Input);
+    // Colors — single dynamic list. Solid uses colors[0]; gradient/animated
+    // use the full array (min 2). Add/remove rows as needed.
+    const colorsRow = mkField('Colors');
+    const colorsList = document.createElement('div');
+    colorsList.classList.add('bg-modal-color-list');
+    colorsRow.appendChild(colorsList);
+    const renderColors = () => {
+      colorsList.innerHTML = '';
+      const isSolid = state.type === 'solid';
+      const min = isSolid ? 1 : 2;
+      // Solid only ever renders one swatch — extras are kept in state but hidden.
+      const visibleCount = isSolid ? 1 : state.colors.length;
+      for (let i = 0; i < visibleCount; i++) {
+        const item = document.createElement('div');
+        item.classList.add('bg-modal-color-item');
+        const inp = document.createElement('input');
+        inp.type = 'color';
+        inp.value = state.colors[i];
+        inp.addEventListener('input', () => {
+          state.colors[i] = inp.value;
+          apply();
+        });
+        item.appendChild(inp);
+        if (!isSolid) {
+          const rm = document.createElement('button');
+          rm.type = 'button';
+          rm.classList.add('bg-modal-color-rm');
+          rm.textContent = '✕';
+          rm.title = 'Remove color';
+          rm.disabled = state.colors.length <= min;
+          rm.addEventListener('click', () => {
+            if (state.colors.length > min) {
+              state.colors.splice(i, 1);
+              renderColors();
+              apply();
+            }
+          });
+          item.appendChild(rm);
+        }
+        colorsList.appendChild(item);
+      }
+      if (!isSolid) {
+        const add = document.createElement('button');
+        add.type = 'button';
+        add.classList.add('bg-modal-color-add');
+        add.textContent = '+ Add color';
+        add.addEventListener('click', () => {
+          // New stop defaults to a copy of the last color so the gradient
+          // doesn't jump to a random hue when extended.
+          state.colors.push(state.colors[state.colors.length - 1] || '#cccccc');
+          renderColors();
+          apply();
+        });
+        colorsList.appendChild(add);
+      }
+    };
 
     // Angle
     const angleRow = mkField('Angle');
@@ -2708,6 +3926,36 @@ export class EditMode {
     angleInput.step = '1';
     angleInput.value = state.angle;
     angleRow.appendChild(angleInput);
+
+    // Faded toggle — smooth blends vs hard color stops
+    state.faded = state.faded !== false;
+    const fadedRow = mkField('Faded');
+    const fadedCheck = document.createElement('input');
+    fadedCheck.type = 'checkbox';
+    fadedCheck.checked = state.faded;
+    fadedCheck.title = 'Smooth blends between colors. Off = hard color bands.';
+    fadedRow.appendChild(fadedCheck);
+    fadedCheck.addEventListener('change', () => { state.faded = fadedCheck.checked; apply(); });
+
+    // Rotate — cyclic shift of the color positions along the gradient
+    state.colorRotate = state.colorRotate ?? 0;
+    const rotateRow = mkField('Rotate');
+    const rotateSlider = document.createElement('input');
+    rotateSlider.type = 'range';
+    rotateSlider.min = '0';
+    rotateSlider.max = '1';
+    rotateSlider.step = '0.01';
+    rotateSlider.value = state.colorRotate;
+    rotateSlider.classList.add('bg-modal-range');
+    const rotateVal = document.createElement('span');
+    rotateVal.classList.add('bg-modal-range-val');
+    rotateVal.textContent = (state.colorRotate * 100).toFixed(0) + '%';
+    rotateRow.append(rotateSlider, rotateVal);
+    rotateSlider.addEventListener('input', () => {
+      state.colorRotate = parseFloat(rotateSlider.value);
+      rotateVal.textContent = (state.colorRotate * 100).toFixed(0) + '%';
+      apply();
+    });
 
     // Preset
     const presetRow = mkField('Animation');
@@ -2726,6 +3974,8 @@ export class EditMode {
 
     // Parallax depth
     state.parallax = state.parallax ?? 0;
+    state.parallaxBg = state.parallaxBg !== false;
+    state.parallaxElements = state.parallaxElements !== false;
     const parallaxRow = mkField('Parallax');
     const parallaxSlider = document.createElement('input');
     parallaxSlider.type = 'range';
@@ -2739,13 +3989,54 @@ export class EditMode {
     parallaxVal.textContent = state.parallax.toFixed(2);
     parallaxRow.append(parallaxSlider, parallaxVal);
 
+    const mkParallaxToggle = (labelText, key) => {
+      const row = mkField(labelText);
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = state[key];
+      row.appendChild(cb);
+      cb.addEventListener('change', () => {
+        state[key] = cb.checked;
+        apply();
+      });
+      return row;
+    };
+    const parallaxBgRow = mkParallaxToggle('Parallax background', 'parallaxBg');
+    const parallaxElRow = mkParallaxToggle('Parallax elements', 'parallaxElements');
+
+    // Page length — fixed scroll length in viewport heights (vh-based so it
+    // adapts across displays). Empty = auto (content-driven).
+    const scrollLenRow = mkField('Page length');
+    const scrollLenInput = document.createElement('input');
+    scrollLenInput.type = 'number';
+    scrollLenInput.min = '1';
+    scrollLenInput.step = '0.5';
+    scrollLenInput.placeholder = 'auto';
+    scrollLenInput.value = state.scrollLength || '';
+    scrollLenInput.title = 'Number of viewport-heights of scroll. Leave empty for auto (fits content).';
+    const scrollLenSuffix = document.createElement('span');
+    scrollLenSuffix.classList.add('bg-modal-range-val');
+    scrollLenSuffix.textContent = 'screens';
+    scrollLenRow.append(scrollLenInput, scrollLenSuffix);
+    scrollLenInput.addEventListener('input', () => {
+      const v = parseFloat(scrollLenInput.value);
+      if (Number.isFinite(v) && v >= 1) state.scrollLength = v;
+      else delete state.scrollLength;
+      apply();
+    });
+
     // ── Overlay effect: Stitch ──
     state.effect = state.effect || 'none';
     if (!state.stitch) state.stitch = { speed: 120, stitchLen: 10, palette: 'warm', style: 'running', curliness: 3 };
 
     const effectRow = mkField('Effect');
     const effectSel = document.createElement('select');
-    [['none', 'None'], ['stitch', 'Stitch'], ['stitch-wander', 'Stitch (wander)']].forEach(([val, lbl]) => {
+    [
+      ['none', 'None'],
+      ['stitch', 'Stitch'],
+      ['stitch-wander', 'Stitch (wander)'],
+      ['stitch-pathed', 'Stitch (pathed)'],
+    ].forEach(([val, lbl]) => {
       const opt = document.createElement('option');
       opt.value = val;
       opt.textContent = lbl;
@@ -2753,6 +4044,13 @@ export class EditMode {
       effectSel.appendChild(opt);
     });
     effectRow.appendChild(effectSel);
+
+    // Edit-points button — only visible when effect is stitch-pathed
+    if (!state.stitchPath) state.stitchPath = { points: [], closed: true };
+    const editPointsBtn = document.createElement('button');
+    editPointsBtn.classList.add('bg-modal-btn');
+    editPointsBtn.textContent = 'Edit points';
+    effectRow.appendChild(editPointsBtn);
 
     // Stitch sub-controls container
     const stitchGroup = document.createElement('div');
@@ -2763,7 +4061,7 @@ export class EditMode {
     const stitchPaletteRow = mkField('Palette');
     stitchGroup.appendChild(stitchPaletteRow);
     const stitchPaletteSel = document.createElement('select');
-    [['warm', 'Warm'], ['cool', 'Cool'], ['pastel', 'Pastel'], ['mono', 'Mono']].forEach(([val, lbl]) => {
+    [['warm', 'Warm'], ['cool', 'Cool'], ['pastel', 'Pastel'], ['mono', 'Mono'], ['custom', 'Custom']].forEach(([val, lbl]) => {
       const opt = document.createElement('option');
       opt.value = val;
       opt.textContent = lbl;
@@ -2772,11 +4070,66 @@ export class EditMode {
     });
     stitchPaletteRow.appendChild(stitchPaletteSel);
 
+    // Custom palette colors (only shown when palette === 'custom'). The
+    // stitch effect already reads `state.stitch.customColors` via pickColor()
+    // when palette is 'custom' — this UI just lets the user edit that list.
+    const customPaletteRow = mkField('Custom colors');
+    stitchGroup.appendChild(customPaletteRow);
+    const customPaletteList = document.createElement('div');
+    customPaletteList.classList.add('bg-modal-color-list');
+    customPaletteRow.appendChild(customPaletteList);
+    if (!Array.isArray(state.stitch.customColors) || state.stitch.customColors.length === 0) {
+      // Seed from the current preset so switching to Custom isn't a blank slate
+      const preset = STITCH_PALETTES[state.stitch.palette];
+      state.stitch.customColors = (preset || STITCH_PALETTES.warm).slice();
+    }
+    const renderCustomPalette = () => {
+      customPaletteList.innerHTML = '';
+      state.stitch.customColors.forEach((c, i) => {
+        const item = document.createElement('div');
+        item.classList.add('bg-modal-color-item');
+        const inp = document.createElement('input');
+        inp.type = 'color';
+        inp.value = c;
+        inp.addEventListener('input', () => {
+          state.stitch.customColors[i] = inp.value;
+          apply();
+        });
+        const rm = document.createElement('button');
+        rm.type = 'button';
+        rm.classList.add('bg-modal-color-rm');
+        rm.textContent = '✕';
+        rm.title = 'Remove color';
+        rm.disabled = state.stitch.customColors.length <= 1;
+        rm.addEventListener('click', () => {
+          if (state.stitch.customColors.length > 1) {
+            state.stitch.customColors.splice(i, 1);
+            renderCustomPalette();
+            apply();
+          }
+        });
+        item.append(inp, rm);
+        customPaletteList.appendChild(item);
+      });
+      const add = document.createElement('button');
+      add.type = 'button';
+      add.classList.add('bg-modal-color-add');
+      add.textContent = '+ Add color';
+      add.addEventListener('click', () => {
+        const last = state.stitch.customColors[state.stitch.customColors.length - 1];
+        state.stitch.customColors.push(last || '#cccccc');
+        renderCustomPalette();
+        apply();
+      });
+      customPaletteList.appendChild(add);
+    };
+    renderCustomPalette();
+
     // Stitch style
     const stitchStyleRow = mkField('Stitch style');
     stitchGroup.appendChild(stitchStyleRow);
     const stitchStyleSel = document.createElement('select');
-    [['running', 'Running'], ['backstitch', 'Backstitch'], ['zigzag', 'Zigzag'], ['chain', 'Chain'], ['mixed', 'Mixed']].forEach(([val, lbl]) => {
+    [['running', 'Running'], ['backstitch', 'Backstitch'], ['zigzag', 'Zigzag'], ['chain', 'Chain'], ['satin', 'Satin'], ['mixed', 'Mixed']].forEach(([val, lbl]) => {
       const opt = document.createElement('option');
       opt.value = val;
       opt.textContent = lbl;
@@ -2830,26 +4183,51 @@ export class EditMode {
     curlinessVal.textContent = state.stitch.curliness;
     curlinessRow.append(curlinessSlider, curlinessVal);
 
+    // Continuous (pathed only) — when checked, the trail never fades, so
+    // successive passes layer onto the design like real embroidery.
+    const continuousRow = mkField('Continuous');
+    continuousRow.classList.add('bg-modal-continuous-row');
+    stitchGroup.appendChild(continuousRow);
+    const continuousCheck = document.createElement('input');
+    continuousCheck.type = 'checkbox';
+    continuousCheck.checked = !!state.stitchPath?.continuous;
+    continuousRow.appendChild(continuousCheck);
+
     backdrop.appendChild(modal);
     document.body.appendChild(backdrop);
 
     const syncVisibility = () => {
       const t = state.type;
-      color1Row.classList.toggle('is-hidden', false);
-      // Color 1 label text tweaks for solid vs. gradient
-      color1Row.querySelector('label').textContent = t === 'solid' ? 'Color' : 'Color 1';
-      color2Row.classList.toggle('is-hidden', t === 'solid');
+      // Re-render the colors list so add/remove + count match the current type
+      // (solid → one swatch; gradient/animated → all swatches with controls).
+      renderColors();
+      colorsRow.querySelector('label').textContent = t === 'solid' ? 'Color' : 'Colors';
       angleRow.classList.toggle('is-hidden', t === 'solid');
+      // Faded only matters when there's a gradient/animated bg
+      fadedRow.classList.toggle('is-hidden', t === 'solid');
+      // Rotate slider only when there's more than one color (and not solid)
+      const hasMultiColors = Array.isArray(state.colors) && state.colors.length > 1;
+      rotateRow.classList.toggle('is-hidden', t === 'solid' || !hasMultiColors);
       presetRow.classList.toggle('is-hidden', t !== 'animated');
       // Parallax only makes sense for non-solid types
       parallaxRow.classList.toggle('is-hidden', t === 'solid');
+      parallaxBgRow.classList.toggle('is-hidden', t === 'solid');
+      parallaxElRow.classList.toggle('is-hidden', t === 'solid');
       // Stitch sub-controls only visible when effect is 'stitch'
       stitchGroup.classList.toggle('is-hidden', !state.effect.startsWith('stitch'));
+      // Custom palette editor only when palette === 'custom'
+      customPaletteRow.classList.toggle('is-hidden', state.stitch.palette !== 'custom');
+      // Edit-points button + continuous toggle only for pathed stitch
+      editPointsBtn.classList.toggle('is-hidden', state.effect !== 'stitch-pathed');
+      continuousRow.classList.toggle('is-hidden', state.effect !== 'stitch-pathed');
     };
 
     const apply = () => {
       this.board.background = { ...state, stitch: { ...state.stitch } };
       this.board.applyBackground();
+      // Color count may have changed (add/remove) — re-sync rotate row visibility
+      const hasMulti = Array.isArray(state.colors) && state.colors.length > 1;
+      rotateRow.classList.toggle('is-hidden', state.type === 'solid' || !hasMulti);
     };
 
     syncVisibility();
@@ -2860,8 +4238,6 @@ export class EditMode {
       syncVisibility();
       apply();
     });
-    color1Input.addEventListener('input', () => { state.color1 = color1Input.value; apply(); });
-    color2Input.addEventListener('input', () => { state.color2 = color2Input.value; apply(); });
     angleInput.addEventListener('input', () => {
       const v = parseInt(angleInput.value, 10);
       if (!Number.isNaN(v)) { state.angle = v; apply(); }
@@ -2877,7 +4253,20 @@ export class EditMode {
       syncVisibility();
       apply();
     });
-    stitchPaletteSel.addEventListener('change', () => { state.stitch.palette = stitchPaletteSel.value; apply(); });
+    stitchPaletteSel.addEventListener('change', () => {
+      const prev = state.stitch.palette;
+      state.stitch.palette = stitchPaletteSel.value;
+      // When entering Custom for the first time, seed from the previous preset
+      // so the user has a starting point instead of an empty list.
+      if (state.stitch.palette === 'custom'
+          && (!Array.isArray(state.stitch.customColors) || state.stitch.customColors.length === 0)) {
+        const seed = STITCH_PALETTES[prev] || STITCH_PALETTES.warm;
+        state.stitch.customColors = seed.slice();
+        renderCustomPalette();
+      }
+      syncVisibility();
+      apply();
+    });
     stitchStyleSel.addEventListener('change', () => { state.stitch.style = stitchStyleSel.value; apply(); });
     stitchSpeedSlider.addEventListener('input', () => {
       state.stitch.speed = parseInt(stitchSpeedSlider.value, 10);
@@ -2894,7 +4283,11 @@ export class EditMode {
       curlinessVal.textContent = state.stitch.curliness;
       apply();
     });
-
+    continuousCheck.addEventListener('change', () => {
+      if (!state.stitchPath) state.stitchPath = { points: [], closed: true };
+      state.stitchPath.continuous = continuousCheck.checked;
+      apply();
+    });
     const close = (save) => {
       if (save) {
         this._saveLayout();
@@ -2909,21 +4302,352 @@ export class EditMode {
     backdrop.addEventListener('pointerdown', (e) => {
       if (e.target === backdrop) close(true);
     });
+
+    editPointsBtn.addEventListener('click', () => {
+      this._enterStitchPathEdit(state, apply, backdrop);
+    });
+  }
+
+  /**
+   * Stitch-path point editor. Hides the bg modal, dims site panels, lets user
+   * click/drag to place points, right-click to remove. Esc/Enter exits and
+   * restores the modal. State is mutated in place; the modal's existing close
+   * flow handles persistence.
+   */
+  _enterStitchPathEdit(state, applyFn, modalBackdrop) {
+    if (this._stitchPathEdit) return;
+    if (!state.stitchPath) state.stitchPath = { points: [], closed: true };
+
+    // Hide modal but keep its DOM/state intact
+    modalBackdrop.style.display = 'none';
+    document.body.classList.add('is-bg-path-edit');
+
+    const overlay = document.createElement('div');
+    overlay.classList.add('bg-path-edit-overlay');
+
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.classList.add('bg-path-edit-svg');
+    overlay.appendChild(svg);
+
+    const hint = document.createElement('div');
+    hint.classList.add('bg-path-edit-hint');
+    hint.innerHTML = 'Click empty space to add &nbsp;·&nbsp; Click a point to toggle <b>sharp</b> corner &nbsp;·&nbsp; Drag to move &nbsp;·&nbsp; Right-click to delete &nbsp;·&nbsp; <b>Enter</b> or <b>Esc</b> to finish';
+    overlay.appendChild(hint);
+
+    document.body.appendChild(overlay);
+
+    const norm = (clientX, clientY) => ({
+      x: Math.max(0, Math.min(1, clientX / window.innerWidth)),
+      y: Math.max(0, Math.min(1, clientY / window.innerHeight)),
+    });
+    const denorm = (p) => ({
+      x: p.x * window.innerWidth,
+      y: p.y * window.innerHeight,
+    });
+
+    const render = () => {
+      // Wipe SVG
+      while (svg.firstChild) svg.firstChild.remove();
+      const points = state.stitchPath.points;
+
+      // Connecting polyline (faint preview of path order)
+      if (points.length >= 2) {
+        const poly = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+        const pts = points.map(p => {
+          const px = denorm(p);
+          return `${px.x},${px.y}`;
+        });
+        if (state.stitchPath.closed && points.length >= 3) {
+          const px = denorm(points[0]);
+          pts.push(`${px.x},${px.y}`);
+        }
+        poly.setAttribute('points', pts.join(' '));
+        poly.setAttribute('fill', 'none');
+        poly.setAttribute('stroke', 'rgba(120, 200, 255, 0.5)');
+        poly.setAttribute('stroke-width', '1.5');
+        poly.setAttribute('stroke-dasharray', '4 4');
+        svg.appendChild(poly);
+      }
+
+      // Numbered dots — circles for smooth points, squares for sharp-corner
+      // points (where the needle pivots hard instead of curving).
+      points.forEach((p, i) => {
+        const px = denorm(p);
+        const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        g.classList.add('bg-path-dot');
+        if (p.sharp) g.classList.add('is-sharp');
+        g.setAttribute('data-index', i);
+        g.setAttribute('transform', `translate(${px.x}, ${px.y})`);
+
+        const shape = p.sharp
+          ? document.createElementNS('http://www.w3.org/2000/svg', 'rect')
+          : document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        if (p.sharp) {
+          shape.setAttribute('x', '-12');
+          shape.setAttribute('y', '-12');
+          shape.setAttribute('width', '24');
+          shape.setAttribute('height', '24');
+        } else {
+          shape.setAttribute('r', '12');
+        }
+        shape.setAttribute('fill', 'rgba(20, 30, 50, 0.85)');
+        shape.setAttribute('stroke', p.sharp ? '#ffb86b' : '#7ac4ff');
+        shape.setAttribute('stroke-width', '2');
+        g.appendChild(shape);
+
+        const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        label.setAttribute('text-anchor', 'middle');
+        label.setAttribute('dominant-baseline', 'central');
+        label.setAttribute('fill', '#fff');
+        label.setAttribute('font-size', '11');
+        label.setAttribute('font-family', 'Inter, sans-serif');
+        label.textContent = String(i + 1);
+        g.appendChild(label);
+
+        svg.appendChild(g);
+      });
+    };
+
+    let dragIdx = -1;
+    let didDrag = false;
+
+    const onPointerDown = (e) => {
+      // Right-click handled by contextmenu listener
+      if (e.button !== 0) return;
+      const dot = e.target.closest('.bg-path-dot');
+      if (dot) {
+        dragIdx = parseInt(dot.getAttribute('data-index'), 10);
+        didDrag = false;
+        overlay.setPointerCapture(e.pointerId);
+        e.preventDefault();
+        return;
+      }
+      // Click on empty space → append point
+      const p = norm(e.clientX, e.clientY);
+      state.stitchPath.points.push(p);
+      render();
+      applyFn();
+    };
+
+    const onPointerMove = (e) => {
+      if (dragIdx < 0) return;
+      didDrag = true;
+      const p = norm(e.clientX, e.clientY);
+      state.stitchPath.points[dragIdx] = p;
+      render();
+      // Don't re-apply during drag — setPoints resets the trail. Apply on release.
+    };
+
+    const onPointerUp = (e) => {
+      if (dragIdx >= 0) {
+        try { overlay.releasePointerCapture(e.pointerId); } catch {}
+        const idx = dragIdx;
+        const dragged = didDrag;
+        dragIdx = -1;
+        if (dragged) {
+          applyFn();
+        } else {
+          // No drag — treat as a click on the dot, toggle its sharp flag.
+          // Sharp = needle pivots hard at this point; smooth = curves through.
+          const p = state.stitchPath.points[idx];
+          if (p) p.sharp = !p.sharp;
+          render();
+          applyFn();
+        }
+      }
+    };
+
+    const onContextMenu = (e) => {
+      const dot = e.target.closest('.bg-path-dot');
+      if (!dot) return;
+      e.preventDefault();
+      const idx = parseInt(dot.getAttribute('data-index'), 10);
+      state.stitchPath.points.splice(idx, 1);
+      render();
+      applyFn();
+    };
+
+    const onKey = (e) => {
+      if (e.key === 'Escape' || e.key === 'Enter') {
+        e.preventDefault();
+        exit();
+      }
+    };
+
+    const exit = () => {
+      overlay.removeEventListener('pointerdown', onPointerDown);
+      overlay.removeEventListener('pointermove', onPointerMove);
+      overlay.removeEventListener('pointerup', onPointerUp);
+      overlay.removeEventListener('contextmenu', onContextMenu);
+      window.removeEventListener('keydown', onKey, true);
+      overlay.remove();
+      document.body.classList.remove('is-bg-path-edit');
+      modalBackdrop.style.display = '';
+      this._stitchPathEdit = null;
+    };
+
+    overlay.addEventListener('pointerdown', onPointerDown);
+    overlay.addEventListener('pointermove', onPointerMove);
+    overlay.addEventListener('pointerup', onPointerUp);
+    overlay.addEventListener('contextmenu', onContextMenu);
+    window.addEventListener('keydown', onKey, true);
+
+    this._stitchPathEdit = { exit };
+    render();
+    applyFn();
+  }
+
+  // ── Pages dropdown (multi-page management) ──
+
+  _buildPagesMenu() {
+    const wrap = document.createElement('div');
+    wrap.classList.add('edit-dropdown');
+
+    const btn = document.createElement('button');
+    const current = pagesIndex.pages.find(p => p.slug === this.pageSlug);
+    const label = current ? current.name : this.pageSlug;
+    btn.innerHTML = `Page: <strong style="margin:0 .25rem;color:var(--ed-text)">${label}</strong><span class="edit-btn-caret">▾</span>`;
+    btn.classList.add('edit-btn');
+    wrap.appendChild(btn);
+
+    const menu = document.createElement('div');
+    menu.classList.add('edit-dropdown-menu');
+    menu.style.minWidth = '220px';
+
+    for (const p of pagesIndex.pages) {
+      const row = document.createElement('div');
+      row.classList.add('edit-dropdown-item');
+      row.style.justifyContent = 'space-between';
+
+      const left = document.createElement('span');
+      left.textContent = p.name;
+      if (p.slug === this.pageSlug) {
+        left.style.color = 'var(--ed-text)';
+        left.style.fontWeight = '600';
+        left.textContent = '• ' + p.name;
+      }
+      left.style.flex = '1';
+      left.style.cursor = 'pointer';
+      left.addEventListener('click', () => {
+        if (p.slug !== this.pageSlug) this._gotoPage(p.slug);
+      });
+      row.appendChild(left);
+
+      if (p.slug !== 'home') {
+        const del = document.createElement('span');
+        del.textContent = '✕';
+        del.title = `Delete ${p.name}`;
+        del.style.cssText = 'opacity:.55;padding:0 .35rem;cursor:pointer;font-size:.7rem;';
+        del.addEventListener('mouseenter', () => { del.style.opacity = '1'; del.style.color = 'var(--ed-danger, #ff6464)'; });
+        del.addEventListener('mouseleave', () => { del.style.opacity = '.55'; del.style.color = ''; });
+        del.addEventListener('click', (e) => {
+          e.stopPropagation();
+          this._deletePage(p.slug, p.name);
+        });
+        row.appendChild(del);
+      }
+      menu.appendChild(row);
+    }
+
+    const sep = document.createElement('div');
+    sep.style.cssText = 'height:1px;background:var(--ed-line-2);margin:4px 0;';
+    menu.appendChild(sep);
+
+    const addRow = document.createElement('div');
+    addRow.classList.add('edit-dropdown-item');
+    addRow.textContent = '+ New page…';
+    addRow.style.color = 'var(--ed-accent, #6cf)';
+    addRow.addEventListener('click', () => this._createPagePrompt());
+    menu.appendChild(addRow);
+
+    wrap.appendChild(menu);
+    return wrap;
+  }
+
+  async _gotoPage(slug) {
+    if (this.active) {
+      try { await this._saveLayout({ silent: true }); } catch {}
+    }
+    const url = new URL(window.location.href);
+    url.pathname = slug === 'home' ? '/' : `/${slug}`;
+    window.location.href = url.toString();
+  }
+
+  async _createPagePrompt() {
+    const raw = window.prompt(
+      'New page slug (lowercase, hyphens, e.g. "store" or "art-portfolio"):',
+    );
+    if (raw == null) return;
+    const slug = raw.trim().toLowerCase();
+    if (!/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(slug) || slug === 'home') {
+      this._flash('Invalid slug', true);
+      return;
+    }
+    if (pagesIndex.pages.some(p => p.slug === slug)) {
+      this._flash('Page already exists', true);
+      return;
+    }
+    const name = window.prompt('Display name (optional):', slug) || slug;
+    try {
+      const res = await fetch('/api/create-page', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slug, name: name.trim() }),
+      });
+      const result = await res.json().catch(() => ({}));
+      if (!res.ok || !result.ok) {
+        this._flash(result.error || 'Could not create page', true);
+        return;
+      }
+      // Navigate to the new page (with ?edit so they land in the editor).
+      const url = new URL(window.location.href);
+      url.pathname = `/${slug}`;
+      url.searchParams.set('edit', '');
+      window.location.href = url.toString();
+    } catch {
+      this._flash('Save failed — are you on the dev server?', true);
+    }
+  }
+
+  async _deletePage(slug, name) {
+    if (!window.confirm(`Delete page "${name}"? This removes its layout file.`)) return;
+    try {
+      const res = await fetch('/api/delete-page', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slug }),
+      });
+      const result = await res.json().catch(() => ({}));
+      if (!res.ok || !result.ok) {
+        this._flash(result.error || 'Could not delete page', true);
+        return;
+      }
+      // If we just deleted the page we're currently on, bounce to home.
+      if (slug === this.pageSlug) {
+        const url = new URL(window.location.href);
+        url.pathname = '/';
+        window.location.href = url.toString();
+      }
+      // Otherwise rely on the Vite reload triggered by writing pages.json.
+    } catch {
+      this._flash('Save failed — are you on the dev server?', true);
+    }
   }
 
   // ── Save layout to disk (dev server only) ──
 
-  async _saveLayout() {
+  async _saveLayout(opts = {}) {
     const data = this.board.getLayoutData();
     const json = JSON.stringify(data, null, 2);
+    const url = `/api/save-layout?slug=${encodeURIComponent(this.pageSlug)}`;
     try {
-      const res = await fetch('/api/save-layout', {
+      const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: json,
       });
       if (res.ok) {
-        this._flash('Layout saved');
+        if (!opts.silent) this._flash('Layout saved');
       } else {
         this._flash('Save failed — are you on the dev server?', true);
       }

@@ -1,0 +1,12 @@
+{
+  "pages": [
+    {
+      "slug": "home",
+      "name": "Home"
+    },
+    {
+      "slug": "test",
+      "name": "test"
+    }
+  ]
+}
