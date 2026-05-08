@@ -887,7 +887,7 @@ export class EditMode {
     srcInput.type = 'text';
     srcInput.classList.add('pe-input');
     srcInput.value = content.src || '';
-    srcInput.placeholder = '/games/stitch-arcade/';
+    srcInput.placeholder = 'https://textiletroll.github.io/arcade/stitch/';
     srcInput.addEventListener('input', () => {
       content.src = srcInput.value;
       this._rebuildSelected();
@@ -3405,7 +3405,7 @@ export class EditMode {
       colSpan,
       rowSpan,
       layer: 1,
-      content: { src: '/games/stitch-arcade/', title: 'Stitch Arcade' },
+      content: { src: 'https://textiletroll.github.io/arcade/stitch/', title: 'Stitch' },
       style: { borderRadius: 0, opacity: 1, rotation: 0, hoverLift: false },
     };
     this.board.addElement(config);

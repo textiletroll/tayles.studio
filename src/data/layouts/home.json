@@ -1,7 +1,7 @@
 {
   "grid": {
     "columns": 96,
-    "rowHeight": 18,
+    "rowHeight": 19,
     "gap": 0
   },
   "elements": [
@@ -55,7 +55,7 @@
     {
       "id": "text-1777257842880-1",
       "type": "text",
-      "gridColumn": 51,
+      "gridColumn": 38,
       "gridRow": 29,
       "colSpan": 30,
       "rowSpan": 14,
@@ -63,8 +63,8 @@
         "fontSize": 9,
         "text": "New!!",
         "frame": {
-          "x": -5,
-          "y": -20,
+          "x": -2,
+          "y": -10,
           "width": 81,
           "height": 35,
           "rotation": -23
@@ -445,8 +445,8 @@
     {
       "id": "viewport-1777392037120-3",
       "type": "viewport",
-      "gridColumn": 37,
-      "gridRow": 29,
+      "gridColumn": 28,
+      "gridRow": 27,
       "colSpan": 6,
       "rowSpan": 4,
       "style": {
@@ -570,8 +570,8 @@
     {
       "id": "picture-1778265848906-1",
       "type": "picture",
-      "gridColumn": 32,
-      "gridRow": 41,
+      "gridColumn": 36,
+      "gridRow": 43,
       "colSpan": 14,
       "rowSpan": 15,
       "layer": 1,
@@ -592,6 +592,32 @@
         "scroll": "none"
       },
       "spawnDelay": 0.6
+    },
+    {
+      "id": "iframe-1778274331678-1",
+      "type": "iframe",
+      "gridColumn": 71,
+      "gridRow": 20,
+      "colSpan": 26,
+      "rowSpan": 31,
+      "layer": 7,
+      "content": {
+        "src": "https://textiletroll.github.io/arcade/stitch/",
+        "title": "Stitch Arcade"
+      },
+      "style": {
+        "borderRadius": 0,
+        "opacity": 1,
+        "rotation": 0,
+        "hoverLift": false
+      },
+      "animation": {
+        "enabled": false,
+        "entrance": "fadeInUp",
+        "exit": "none",
+        "scroll": "none"
+      },
+      "locked": true
     }
   ],
   "background": {
