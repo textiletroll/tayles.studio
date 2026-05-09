@@ -602,8 +602,8 @@
       "rowSpan": 31,
       "layer": 7,
       "content": {
-        "src": "https://textiletroll.github.io/arcade/stitch/",
-        "title": "Stitch Arcade"
+        "src": "https://textiletroll.github.io/arcade/shape-stitcher/",
+        "title": "Shape Stitcher"
       },
       "style": {
         "borderRadius": 0,
